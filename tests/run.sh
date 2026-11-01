@@ -124,7 +124,46 @@ check "(null? (cdr (list 1)))" '#t'
 check '(let ([p (cons 1 2)]) (+ (car p) (cdr p)))' '3'
 check '(car (cdr (list 10 20 30)))' '20'
 
+# ── functions
+check '(define (sq x) (* x x)) (sq 7)' '49'
+check '(define (f) 42) (f)' '42'
+check '(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 19)' '121645100408832000'
+check '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 25)' '75025'
+check '(define (sub a b) (- a b)) (sub 10 3)' '7'                         # argument order
+check '(define (g x) (* x 10)) (define (f a b) (+ a b)) (f (g 1) (g 2))' '30'  # nested calls as args
+check '(define (f a b c d e f2 g h) (list a b c d e f2 g h)) (f 1 2 3 4 5 6 7 8)' '(1 2 3 4 5 6 7 8)'
+check '(define (later) (sooner)) (define (sooner) 5) (later)' '5'        # define order doesn't matter
+check '(define (f x) (let ([y (* x 2)]) (+ x y))) (f 5)' '15'
+check '(define (id x) x) (let ([a 1] [b (id 2)]) (+ a b (id 3)))' '6'     # call results don't clobber locals
+check '(define (f x) x) 1 2 (f 3)' '3'                                   # last expression is printed
+check '(define (sum-to n) (if (= n 0) 0 (+ n (sum-to (- n 1))))) (sum-to 10000)' '50005000'
+
+# ── lists with recursion
+check '(define (len l) (if (null? l) 0 (add1 (len (cdr l))))) (len (list 1 2 3 4))' '4'
+check '(define (app a b) (if (null? a) b (cons (car a) (app (cdr a) b)))) (app (list 1 2) (list 3 4))' '(1 2 3 4)'
+check '(define (rev l acc) (if (null? l) acc (rev (cdr l) (cons (car l) acc)))) (rev (list 1 2 3) (quote ()))' '(3 2 1)'
+check '(define (range a b) (if (>= a b) (quote ()) (cons a (range (add1 a) b)))) (range 0 5)' '(0 1 2 3 4)'
+
+# ── tail calls (these overflow the 8 MB stack without proper tail calls)
+check '(define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc 1)))) (loop 10000000 0)' '10000000'
+check '(define (ev? n) (if (= n 0) #t (od? (- n 1))))
+       (define (od? n) (if (= n 0) #f (ev? (- n 1))))
+       (ev? 1000001)' '#f'
+check '(define (count n) (cond [(= n 0) 0] [else (count (sub1 n))])) (count 5000000)' '0'
+check '(define (build n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))
+       (define (all-pos? l) (or (null? l) (and (> (car l) 0) (all-pos? (cdr l)))))
+       (all-pos? (build 1000000 (quote ())))' '#t'
+check '(define (loop n) (let ([m (- n 1)]) (if (= m 0) 99 (loop m)))) (loop 5000000)' '99'
+
 # ── errors
+check_error '(define (f x) x) (f 1 2)' 'expects 1 argument'
+check_error '(define (f x) x) (define (f y) y) (f 1)' 'defined twice'
+check_error '(define (f x) x) f' 'is a function'
+check_error '(define (f x) (x 1)) (f 1)' 'is a variable'
+check_error '(define (if x) x) 1' "can't redefine"
+check_error '(define (f x x) x) 1' 'duplicate parameter'
+check_error '(define (f x) x)' 'no expression'
+check_error '(let ([x 1]) (define (f) 1) 2)' 'top level'
 check_error '(foo 1)' 'unknown function'
 check_error '(add1 1 2)' 'expects 1 argument'
 check_error '(1 2)' "can't apply"

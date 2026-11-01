@@ -117,6 +117,7 @@ fn parse(tokens: &[Token], pos: &mut usize) -> Result<Expr, String> {
 }
 
 /// Read exactly one expression from `src`.
+#[cfg(test)]
 pub fn read(src: &str) -> Result<Expr, String> {
     let tokens = tokenize(src)?;
     let mut pos = 0;
@@ -125,6 +126,17 @@ pub fn read(src: &str) -> Result<Expr, String> {
         return Err("extra input after expression".into());
     }
     Ok(expr)
+}
+
+/// Read every expression in `src` (a whole program).
+pub fn read_all(src: &str) -> Result<Vec<Expr>, String> {
+    let tokens = tokenize(src)?;
+    let mut pos = 0;
+    let mut exprs = Vec::new();
+    while pos < tokens.len() {
+        exprs.push(parse(&tokens, &mut pos)?);
+    }
+    Ok(exprs)
 }
 
 #[cfg(test)]
@@ -166,5 +178,12 @@ mod tests {
         assert!(read("(1 2").is_err());
         assert!(read(")").is_err());
         assert!(read("1 2").is_err());
+    }
+
+    #[test]
+    fn reads_whole_program() {
+        let forms = read_all("(define (f x) x) ; comment\n(f 1)").unwrap();
+        assert_eq!(forms.len(), 2);
+        assert!(read_all("(f 1))").is_err());
     }
 }

@@ -25,9 +25,9 @@ fn main() {
     let asm_only = args.iter().any(|a| a == "-S");
 
     let src = fs::read_to_string(input).unwrap_or_else(|e| fail(&format!("{input}: {e}")));
-    let expr = reader::read(&src).unwrap_or_else(|e| fail(&format!("parse error: {e}")));
+    let forms = reader::read_all(&src).unwrap_or_else(|e| fail(&format!("parse error: {e}")));
     let asm =
-        compiler::compile_program(&expr).unwrap_or_else(|e| fail(&format!("compile error: {e}")));
+        compiler::compile_program(&forms).unwrap_or_else(|e| fail(&format!("compile error: {e}")));
 
     if asm_only {
         print!("{asm}");
