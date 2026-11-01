@@ -1,4 +1,4 @@
-;;; schemec standard library, written in the subset schemec itself compiles.
+;;; quill's standard library, written in the Scheme quill itself compiles.
 ;;; It is prepended to every program, but only the definitions a program
 ;;; (transitively) uses are compiled. A user definition with the same name wins.
 ;;; Names starting with % are internal helpers.
@@ -9,8 +9,24 @@
   (let loop ([l l] [n 0])
     (if (null? l) n (loop (cdr l) (add1 n)))))
 
-(define (append a b)
-  (if (null? a) b (cons (car a) (append (cdr a) b))))
+(define (%append2 a b)
+  (if (null? a) b (cons (car a) (%append2 (cdr a) b))))
+
+(define (append . ls)
+  (cond [(null? ls) '()]
+        [(null? (cdr ls)) (car ls)]
+        [else (%append2 (car ls) (apply append (cdr ls)))]))
+
+(define (list? x)
+  (cond [(null? x) #t] [(pair? x) (list? (cdr x))] [else #f]))
+
+(define (list-copy l) (%append2 l '()))
+
+(define (last-pair l) (if (pair? (cdr l)) (last-pair (cdr l)) l))
+
+(define (iota n)
+  (let loop ([i (sub1 n)] [acc '()])
+    (if (< i 0) acc (loop (sub1 i) (cons i acc)))))
 
 (define (reverse l)
   (let loop ([l l] [acc '()])
@@ -21,13 +37,25 @@
 
 (define (list-ref l k) (car (list-tail l k)))
 
-(define (map f l)
-  (if (null? l) '() (cons (f (car l)) (map f (cdr l)))))
+(define (%map1 f l)
+  (if (null? l) '() (cons (f (car l)) (%map1 f (cdr l)))))
 
-(define (for-each f l)
-  (unless (null? l)
-    (f (car l))
-    (for-each f (cdr l))))
+;; stops at the end of the shortest list
+(define (%map-n f ls)
+  (if (memq '() ls) '()
+      (cons (apply f (%map1 car ls)) (%map-n f (%map1 cdr ls)))))
+
+(define (map f l . ls)
+  (if (null? ls) (%map1 f l) (%map-n f (cons l ls))))
+
+(define (for-each f l . ls)
+  (if (null? ls)
+      (let loop ([l l])
+        (unless (null? l) (f (car l)) (loop (cdr l))))
+      (let loop ([ls (cons l ls)])
+        (unless (memq '() ls)
+          (apply f (%map1 car ls))
+          (loop (%map1 cdr ls))))))
 
 (define (filter keep? l)
   (cond [(null? l) '()]
@@ -52,6 +80,23 @@
 (define (assoc x l)
   (cond [(null? l) #f] [(equal? x (car (car l))) (car l)] [else (assoc x (cdr l))]))
 
+(define (memv x l) (memq x l))   ; eqv? is eq? for fixnums, chars and symbols
+(define (assv x l) (assq x l))
+
+;; stable merge sort
+(define (sort l less?)
+  (define (merge a b)
+    (cond [(null? a) b]
+          [(null? b) a]
+          [(less? (car b) (car a)) (cons (car b) (merge a (cdr b)))]
+          [else (cons (car a) (merge (cdr a) b))]))
+  (define (split l a b)
+    (if (null? l) (cons a b) (split (cdr l) b (cons (car l) a))))
+  (if (or (null? l) (null? (cdr l)))
+      l
+      (let ([halves (split l '() '())])
+        (merge (sort (reverse (car halves)) less?) (sort (reverse (cdr halves)) less?)))))
+
 (define (equal? a b)
   (cond [(eq? a b) #t]
         [(and (pair? a) (pair? b))
@@ -68,14 +113,29 @@
 ;; ───────── numbers ─────────
 
 (define (abs n) (if (< n 0) (- n) n))
-(define (min a b) (if (< a b) a b))
-(define (max a b) (if (> a b) a b))
+(define (min x . xs) (fold-left (lambda (a b) (if (< b a) b a)) x xs))
+(define (max x . xs) (fold-left (lambda (a b) (if (> b a) b a)) x xs))
+(define (number? x) (integer? x))
+(define (positive? n) (> n 0))
+(define (negative? n) (< n 0))
+(define (square n) (* n n))
 (define (even? n) (zero? (remainder n 2)))
 (define (odd? n) (not (even? n)))
 (define (gcd a b) (if (zero? b) (abs a) (gcd b (remainder a b))))
 (define (expt base n) (if (zero? n) 1 (* base (expt base (sub1 n)))))
 
 (define (%digit r) (integer->char (+ 48 (abs r))))
+
+;; #f if s isn't a decimal integer
+(define (string->number s)
+  (let* ([n (string-length s)]
+         [neg? (and (> n 1) (char=? (string-ref s 0) #\-))]
+         [start (if (or neg? (and (> n 1) (char=? (string-ref s 0) #\+))) 1 0)])
+    (let loop ([i start] [acc 0])
+      (cond [(= i n) (and (> n start) (if neg? (- acc) acc))]
+            [(char-numeric? (string-ref s i))
+             (loop (add1 i) (+ (* acc 10) (- (char->integer (string-ref s i)) 48)))]
+            [else #f]))))
 
 ;; works on negative numbers directly so the most negative fixnum is fine too
 (define (number->string n)
@@ -103,13 +163,41 @@
 
 (define (string-copy s) (substring s 0 (string-length s)))
 
-(define (string-append a b)
-  (let* ([la (string-length a)]
-         [r (make-string (+ la (string-length b)))])
-    (let loop ([i 0])
-      (cond [(< i la) (string-set! r i (string-ref a i)) (loop (add1 i))]
-            [(< i (string-length r)) (string-set! r i (string-ref b (- i la))) (loop (add1 i))]
-            [else r]))))
+(define (string-append . strings)
+  (let ([r (make-string (fold-left (lambda (n s) (+ n (string-length s))) 0 strings))])
+    (let copy ([strings strings] [at 0])
+      (if (null? strings)
+          r
+          (let ([s (car strings)])
+            (do ([i 0 (add1 i)]) ((= i (string-length s)))
+              (string-set! r (+ at i) (string-ref s i)))
+            (copy (cdr strings) (+ at (string-length s))))))))
+
+(define (string . chars) (list->string chars))
+
+(define (string<? a b)
+  (let loop ([i 0])
+    (cond [(= i (string-length b)) #f]
+          [(= i (string-length a)) #t]
+          [(char<? (string-ref a i) (string-ref b i)) #t]
+          [(char<? (string-ref b i) (string-ref a i)) #f]
+          [else (loop (add1 i))])))
+
+(define (%string-map f s)
+  (let ([r (make-string (string-length s))])
+    (do ([i 0 (add1 i)]) ((= i (string-length s)) r)
+      (string-set! r i (f (string-ref s i))))))
+
+(define (string-upcase s) (%string-map char-upcase s))
+(define (string-downcase s) (%string-map char-downcase s))
+
+(define (char-alphabetic? c) (let ([d (char-downcase c)]) (and (char<=? #\a d) (char<=? d #\z))))
+(define (char-numeric? c) (and (char<=? #\0 c) (char<=? c #\9)))
+(define (char-whitespace? c) (and (memv c '(#\space #\tab #\newline)) #t))
+(define (char-upper-case? c) (and (char<=? #\A c) (char<=? c #\Z)))
+(define (char-lower-case? c) (and (char<=? #\a c) (char<=? c #\z)))
+(define (char-upcase c) (if (char-lower-case? c) (integer->char (- (char->integer c) 32)) c))
+(define (char-downcase c) (if (char-upper-case? c) (integer->char (+ (char->integer c) 32)) c))
 
 (define (string->list s)
   (let loop ([i (sub1 (string-length s))] [acc '()])
@@ -128,8 +216,36 @@
   (let loop ([i (sub1 (vector-length v))] [acc '()])
     (if (< i 0) acc (loop (sub1 i) (cons (vector-ref v i) acc)))))
 
+(define (vector-map f v)
+  (let ([r (make-vector (vector-length v))])
+    (do ([i 0 (add1 i)]) ((= i (vector-length v)) r)
+      (vector-set! r i (f (vector-ref v i))))))
+
+(define (vector-for-each f v)
+  (do ([i 0 (add1 i)]) ((= i (vector-length v)))
+    (f (vector-ref v i))))
+
+(define (vector-fill! v x)
+  (do ([i 0 (add1 i)]) ((= i (vector-length v)))
+    (vector-set! v i x)))
+
+(define (%list->vector l) (list->vector l))
+
 (define (list->vector l)
   (let ([v (make-vector (length l))])
     (let loop ([l l] [i 0])
       (cond [(null? l) v]
             [else (vector-set! v i (car l)) (loop (cdr l) (add1 i))]))))
+
+;; ───────── variadic primitives used as values, e.g. (fold-left + 0 l) or (apply + l) ─────────
+
+(define (%+ . xs) (let loop ([xs xs] [acc 0]) (if (null? xs) acc (loop (cdr xs) (+ acc (car xs))))))
+(define (%* . xs) (let loop ([xs xs] [acc 1]) (if (null? xs) acc (loop (cdr xs) (* acc (car xs))))))
+(define (%- x . xs)
+  (if (null? xs) (- x) (let loop ([xs xs] [acc x]) (if (null? xs) acc (loop (cdr xs) (- acc (car xs)))))))
+(define (%list . xs) xs)
+(define (%vector . xs) (list->vector xs))
+
+(define (%spread args)   ; (a b (c d)) -> (a b c d)
+  (if (null? (cdr args)) (car args) (cons (car args) (%spread (cdr args)))))
+(define (%apply f . args) (apply f (%spread args)))

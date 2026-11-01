@@ -10,9 +10,9 @@ pass=0; fail=0
 check() { # check <program> <expected output>
   # runs twice: normally, and with a 1 KB starting heap so the GC runs constantly
   printf '%s' "$1" > "$tmp/t.scm"
-  if ./target/debug/schemec "$tmp/t.scm" -o "$tmp/t" 2>"$tmp/err" \
+  if ./target/debug/quill "$tmp/t.scm" -o "$tmp/t" 2>"$tmp/err" \
      && got=$("$tmp/t" 2>"$tmp/err") && [ "$got" = "$2" ] \
-     && got=$(SCHEMEC_HEAP_KB=1 "$tmp/t" 2>"$tmp/err") && [ "$got" = "$2" ]; then
+     && got=$(QUILL_HEAP_KB=1 "$tmp/t" 2>"$tmp/err") && [ "$got" = "$2" ]; then
     pass=$((pass+1))
   else
     fail=$((fail+1)); echo "FAIL: $1"; echo "   expected: $2"; echo "   got:      $got $(cat "$tmp/err")"
@@ -22,7 +22,7 @@ check() { # check <program> <expected output>
 
 check_error() { # check_error <program> <substring of the compile error>
   printf '%s' "$1" > "$tmp/t.scm"
-  if ! ./target/debug/schemec "$tmp/t.scm" -o "$tmp/t" 2>"$tmp/err" && grep -qF -- "$2" "$tmp/err"; then
+  if ! ./target/debug/quill "$tmp/t.scm" -o "$tmp/t" 2>"$tmp/err" && grep -qF -- "$2" "$tmp/err"; then
     pass=$((pass+1))
   else
     fail=$((fail+1)); echo "FAIL (expected compile error '$2'): $1"; cat "$tmp/err"
@@ -31,12 +31,28 @@ check_error() { # check_error <program> <substring of the compile error>
 
 check_runtime_error() { # check_runtime_error <program> <substring of stderr>
   printf '%s' "$1" > "$tmp/t.scm"
-  if ./target/debug/schemec "$tmp/t.scm" -o "$tmp/t" 2>"$tmp/err" \
+  if ./target/debug/quill "$tmp/t.scm" -o "$tmp/t" 2>"$tmp/err" \
      && ! "$tmp/t" >/dev/null 2>"$tmp/err" && grep -qF -- "$2" "$tmp/err"; then
     pass=$((pass+1))
   else
     fail=$((fail+1)); echo "FAIL (expected runtime error '$2'): $1"; cat "$tmp/err"
   fi
+}
+
+check_gen() { # check_gen <python expression producing the program> <expected output>
+  check "$(python3 -c "print($1, end='')")" "$2"
+}
+
+check_stderr() { # check_stderr <program> <exact first line of stderr>: compile or runtime errors
+  printf '%s' "$1" > "$tmp/prog.scm"
+  if ./target/debug/quill "$tmp/prog.scm" -o "$tmp/t" 2>"$tmp/err"; then "$tmp/t" >/dev/null 2>"$tmp/err" || true; fi
+  got=$(sed -e "s|$tmp/||" -e 1q "$tmp/err")
+  if [ "$got" = "$2" ]; then
+    pass=$((pass+1))
+  else
+    fail=$((fail+1)); echo "FAIL (stderr): $1"; echo "   expected: $2"; echo "   got:      $got"
+  fi
+  got=
 }
 
 # ── integers
@@ -329,9 +345,154 @@ check_error '(let ([if 1]) if)' 'keyword'
 check_error '(set! nope 1)' 'unbound variable: nope'
 check_error '(define (f) 1) (set! f 2)' 'defined as a function'
 check_error '(let ([x 1] [x 2]) x)' 'duplicate binding'
-check_error '(map list (list 1))' "can't be used as a value"
 check_error '(let ([x 1]) (define y 2))' 'at least one expression'
 check_error '(if)' 'if expects'
+
+# ── rest arguments and apply
+check '((lambda args args) 1 2 3)' '(1 2 3)'
+check '((lambda args args))' '()'
+check '((lambda (a . rest) (list a rest)) 1 2 3)' '(1 (2 3))'
+check '((lambda (a . rest) (list a rest)) 1)' '(1 ())'
+check '(define (f a b . rest) (list a b rest)) (f 1 2 3 4 5)' '(1 2 (3 4 5))'
+check '(define (count . xs) (length xs)) (count 1 2 3 4 5 6 7 8 9 10 11 12)' '12'
+check '(define (sum . xs) (if (null? xs) 0 (+ (car xs) (apply sum (cdr xs))))) (sum 1 2 3 4 5)' '15'
+check '(apply + (list 1 2 3))' '6'
+check '(apply + 1 2 (list 3 4))' '10'
+check '(apply list 1 (list 2 3))' '(1 2 3)'
+check '(apply max (list 3 9 2))' '9'
+check '(apply (lambda (a b c) (- a b c)) (list 10 2 3))' '5'
+check '(define (loop n) (if (= n 0) (quote done) (apply loop (list (- n 1))))) (loop 1000000)' 'done'   # apply in tail position
+check '(apply + (iota 50000))' '1249975000'
+check '(map + (list 1 2) (list 10 20))' '(11 22)'
+check '(map list (list 1 2))' '((1) (2))'
+check '(fold-left + 0 (list 1 2 3))' '6'
+check '(let ([f -]) (f 10 1 2))' '7'
+check '(let ([f *]) (list (f) (f 2 3 4)))' '(1 24)'
+check '(define (f . xs) (set! xs (cons 0 xs)) xs) (f 1 2)' '(0 1 2)'                  # assigning a rest parameter
+check '(define (adder . xs) (lambda (y) (apply + y xs))) ((adder 1 2 3) 10)' '16'      # captured rest parameter
+
+# ── more than 8 arguments
+check '(define (f a b c d e f2 g h i j) (list a j)) (f 1 2 3 4 5 6 7 8 9 10)' '(1 10)'
+check '((lambda (a b c d e f g h i j k) (+ a b c d e f g h i j k)) 1 2 3 4 5 6 7 8 9 10 11)' '66'
+check '(define (f a b c d e f2 g h i j) (if (= a 0) j (f (- a 1) b c d e f2 g h i (+ j 1)))) (f 1000000 0 0 0 0 0 0 0 0 0)' '1000000'  # tail calls with 10 args
+check_gen '"(define (f " + " ".join(f"a{i}" for i in range(300)) + ") (+ a0 a299)) (f " + " ".join(str(i) for i in range(300)) + ")"' '299'
+check_gen '"(length (list " + " ".join(str(i) for i in range(3000)) + "))"' '3000'
+check_gen '"(let (" + " ".join(f"[v{i} {i}]" for i in range(5000)) + ") (+ v0 v4999))"' '4999'       # frame bigger than 32 KB
+
+# ── macros
+check '(define-syntax swap! (syntax-rules () [(_ a b) (let ([tmp a]) (set! a b) (set! b tmp))]))
+       (let ([x 1] [y 2]) (swap! x y) (list x y))' '(2 1)'
+check '(define-syntax swap! (syntax-rules () [(_ a b) (let ([tmp a]) (set! a b) (set! b tmp))]))
+       (let ([tmp 1] [other 2]) (swap! tmp other) (list tmp other))' '(2 1)'               # hygiene: no capture of tmp
+check '(define-syntax my-or (syntax-rules () [(_) #f] [(_ e) e] [(_ e r ...) (let ([t e]) (if t t (my-or r ...)))]))
+       (let ([t 5]) (my-or #f t))' '5'
+check '(define-syntax while (syntax-rules () [(_ c body ...) (let lp () (when c body ... (lp)))]))
+       (let ([i 0] [s 0]) (while (< i 5) (set! s (+ s i)) (set! i (add1 i))) s)' '10'
+check '(define-syntax my-let (syntax-rules () [(_ ([n v] ...) body ...) ((lambda (n ...) body ...) v ...)]))
+       (my-let ([a 1] [b 2]) (+ a b))' '3'
+check '(define-syntax for (syntax-rules (in) [(_ x in lst body ...) (for-each (lambda (x) body ...) lst)]))
+       (for y in (list 1 2 3) (display y))' '123'
+check '(define-syntax unless2 (syntax-rules () [(_ c . body) (if c #f (begin . body))])) (unless2 #f 1 2)' '2'
+check '(define (f) (my-inc 5)) (define-syntax my-inc (syntax-rules () [(_ x) (+ x 1)])) (f)' '6'   # used before its definition
+check '(define-syntax def2 (syntax-rules () [(_ a b v) (begin (define a v) (define b v))])) (def2 p q 7) (+ p q)' '14'
+check_error '(define-syntax m (syntax-rules () [(_ a) a])) (m 1 2)' 'no pattern of macro m matches'
+check_error '(define-syntax m (syntax-rules () [(_ a) a])) (let ([m 1]) m)' 'is a macro'
+
+# ── quasiquote
+check '`(1 ,(+ 1 1) 3)' '(1 2 3)'
+check '(let ([x (list 2 3)]) `(1 ,@x 4))' '(1 2 3 4)'
+check '`(a b)' '(a b)'
+check '(let ([x 5]) `(x ,x))' '(x 5)'
+check '`(1 . ,(+ 1 1))' '(1 . 2)'
+check '`#(1 ,(+ 1 1))' '#(1 2)'
+check '(let ([l (list 1 2)]) `((,@l) ,@l))' '((1 2) 1 2)'
+check '`(1 `(2 ,(3 ,(+ 1 3))))' '(1 (quasiquote (2 (unquote (3 4)))))'   # inner unquote is at depth 1
+
+# ── case, do, vector literals, dotted data
+check '(case 3 [(1 2) (quote low)] [(3 4) (quote mid)] [else (quote high)])' 'mid'
+check '(case (quote b) [(a) 1] [(b c) 2])' '2'
+check '(case 9 [(1) 1] [else 0])' '0'
+check '(case #\x [(#\a) 1] [(#\x #\y) 2])' '2'
+check '(do ([i 0 (add1 i)] [acc (quote ()) (cons i acc)]) ((= i 4) acc))' '(3 2 1 0)'
+check '(let ([v (make-vector 3 0)]) (do ([i 0 (add1 i)]) ((= i 3) v) (vector-set! v i (* i i))))' '#(0 1 4)'
+check '#(1 "two" #\3 (4))' '#(1 "two" #\3 (4))'
+check '(vector-ref #(a b c) 1)' 'b'
+check '(quote (1 2 . 3))' '(1 2 . 3)'
+check '(cdr (quote (a . b)))' 'b'
+
+# ── symbols at run time
+check '(eq? (string->symbol "hello") (quote hello))' '#t'
+check '(eq? (string->symbol "fresh-name") (string->symbol (string-append "fresh" "-name")))' '#t'
+check '(string->symbol "made at runtime")' 'made at runtime'
+check '(symbol->string (string->symbol "abc"))' '"abc"'
+check '(let loop ([i 0]) (if (< i 2000) (begin (string->symbol (number->string i)) (loop (add1 i))) (eq? (string->symbol "1999") (string->symbol "1999"))))' '#t'
+
+# ── more library
+check '(append (list 1) (list 2 3) (list) (list 4))' '(1 2 3 4)'
+check '(append)' '()'
+check '(sort (list 5 2 8 1 9 3) <)' '(1 2 3 5 8 9)'
+check '(sort (list "pear" "apple" "fig") string<?)' '("apple" "fig" "pear")'
+check '(iota 5)' '(0 1 2 3 4)'
+check '(list? (list 1 2))' '#t'
+check '(list? (cons 1 2))' '#f'
+check '(max 1 7 3)' '7'
+check '(min 4 2 8)' '2'
+check '(string-append "a" "b" "c")' '"abc"'
+check '(string #\h #\i)' '"hi"'
+check '(string->number "42")' '42'
+check '(string->number "-17")' '-17'
+check '(string->number "4x")' '#f'
+check '(string-upcase "Hello")' '"HELLO"'
+check '(char-upcase #\a)' '#\A'
+check '(char-numeric? #\5)' '#t'
+check '(char-alphabetic? #\5)' '#f'
+check '(char-whitespace? #\space)' '#t'
+check '(vector-map add1 #(1 2 3))' '#(2 3 4)'
+check '(let ([v (vector 1 2)]) (vector-fill! v 0) v)' '#(0 0)'
+check '(memv 2 (list 1 2 3))' '(2 3)'
+check '(last-pair (list 1 2 3))' '(3)'
+check '(square 12)' '144'
+check '(begin (display "bye") (exit 0) (display "unreachable"))' 'bye'
+check '(display #\λ)' 'λ'
+
+# ── limits
+check '(define (sum-to n) (if (= n 0) 0 (+ n (sum-to (- n 1))))) (sum-to 1000000)' '500000500000'   # deep non-tail recursion
+check '(define (build n) (if (= n 0) (quote ()) (cons n (build (- n 1))))) (length (build 1000000))' '1000000'
+check_runtime_error '(define (f n) (+ 1 (f n))) (f 0)' 'stack overflow'
+check_runtime_error '(* 4611686018427387 1000000)' 'integer overflow'
+check_runtime_error '(+ 2305843009213693951 1)' '+: integer overflow'
+check_runtime_error '(add1 2305843009213693951)' 'add1: integer overflow'
+check_runtime_error '(- -2305843009213693952)' 'integer overflow'
+check_runtime_error '(quotient -2305843009213693952 -1)' 'quotient: integer overflow'
+check '(* -1 2305843009213693951)' '-2305843009213693951'
+check '(* 1518500249 1518500249)' '2305843006213062001'
+check_runtime_error '(define (fact n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 25)' '*: integer overflow'
+check_runtime_error '(apply + 1 2)' 'apply: expected a list, got 2'
+check_runtime_error '((lambda (a b . c) a) 1)' 'expected at least 2 argument(s), got 1'
+check_runtime_error '(integer->char -1)' 'not a character code'
+
+# ── error locations (file:line)
+check_stderr '(define (f x)
+  (car x))
+(f 5)' 'error: prog.scm:2: car: expected a pair, got 5'
+check_stderr '1
+(display
+  (+ 1 "a"))' 'error: prog.scm:3: +: expected an integer, got "a"'
+check_stderr '(define x 1)
+
+(let ([y 2])
+  (foo y))' 'quill: prog.scm:4: unbound variable: foo'
+check_stderr '(define (f a) a)
+(f 1
+   2)' 'quill: prog.scm:2: f expects 1 argument(s), got 2'
+check_stderr '(display 1)
+(display (+ 1 2)' 'quill: prog.scm:2: missing '"')'"' for the '"'('"' here'
+check_stderr '(let ([x 1])
+  (if))' 'quill: prog.scm:2: if expects 2 or 3 arguments'
+check_stderr '(define-syntax m (syntax-rules () [(_ a) (car a)]))
+(m
+  7)' 'error: prog.scm:2: car: expected a pair, got 7'
+check_stderr '(list-ref (list 1 2) 5)' 'error: prelude:36: cdr: expected a pair, got ()'
 
 # ── errors
 check_error '(define (f x) x) (f 1 2)' 'expects 1 argument'
@@ -340,6 +501,15 @@ check_error '(define (if x) x) 1' 'keyword'
 check_error '(define (f x x) x) 1' 'duplicate parameter'
 check_error '(foo 1)' 'unbound variable: foo'
 check_error '(add1 1 2)' 'expects 1 argument'
+
+# ── the example programs compile and run
+for ex in examples/*.scm; do
+  if ./target/debug/quill "$ex" -o "$tmp/ex" 2>"$tmp/err" && "$tmp/ex" >/dev/null 2>>"$tmp/err"; then
+    pass=$((pass+1))
+  else
+    fail=$((fail+1)); echo "FAIL: $ex"; cat "$tmp/err"
+  fi
+done
 
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

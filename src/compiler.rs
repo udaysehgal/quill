@@ -1,4 +1,5 @@
-//! Code generation: `Expr` -> ARM64 assembly (Apple / Mach-O syntax).
+//! Code generation: core forms -> ARM64 assembly (Apple / Mach-O syntax).
+//! The expander (`expand.rs`) has already rewritten everything else.
 //!
 //! # Value representation (64-bit tagged words)
 //!
@@ -21,9 +22,9 @@
 //!
 //! # Registers
 //! - `x0`      accumulator: every expression leaves its result here
-//! - `x0..x7`  arguments on a call (so at most 8 parameters)
+//! - `x0..x7`  the first 8 arguments of a call; the rest go in `scm_argbuf[8..]`
 //! - `x8`      the closure being called;  `x9` the argument count
-//! - `x10`     allocation size for `scm_alloc`;  `x1..x4`, `x9..x11` scratch
+//! - `x10`     allocation size for `scm_alloc`;  `x1..x4`, `x9..x16` scratch
 //! - `x27`     heap limit;  `x28` heap pointer (bump allocator)
 //! - `x29`     frame pointer;  `x30` return address
 //!
@@ -32,13 +33,13 @@
 //!   x29 -> | saved x29, x30 |
 //!          | slot N-1       |
 //!          | ...            |
-//!   sp  -> | slot 0         |   slot k lives at [sp, #8*k]
+//!   sp  -> | slot 0         |   slot k lives at sp + 8*k
 //! ```
 //! Parameters (and the closure, if it has free variables) are copied into the
-//! first slots. Slots hold only valid values (the prologue zeroes them), and
-//! every live value is in a slot whenever allocation can happen, so the
-//! garbage collector can treat every slot of every frame as a root and walk
-//! frames through the saved-x29 chain.
+//! first slots on entry, before anything can allocate. Slots hold only valid
+//! values (the prologue zeroes them), and every live value is in a slot
+//! whenever allocation can happen, so the garbage collector treats every
+//! slot of every frame as a root, walking frames through the saved-x29 chain.
 //!
 //! # Variables
 //! A variable is a stack slot or a field of the current closure. Variables
@@ -49,7 +50,9 @@
 //! A call in tail position tears down the current frame and branches to the
 //! callee, so the callee returns straight to our caller.
 
-use crate::reader::{self, Expr};
+use crate::expand::Expander;
+use crate::reader::{self, Expr, Line};
+use crate::syntax::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -69,19 +72,13 @@ pub const STRING_TAG: i64 = 6;
 
 const FIXNUM_MAX: i64 = (1 << 61) - 1;
 const FIXNUM_MIN: i64 = -(1 << 61);
-const MAX_SLOTS: usize = 4095; // limit of `ldr x, [sp, #imm]` (imm/8 <= 4095)
-const MAX_ARGS: usize = 8; // passed in x0..x7
+/// Stack slots per frame (8 MB).
+const MAX_SLOTS: usize = 1 << 20;
+/// Size of `scm_argbuf`: the most arguments `apply` can pass.
+pub const ARGBUF_SIZE: usize = 1 << 16;
+const REG_ARGS: usize = 8;
 
 const PRELUDE: &str = include_str!("prelude.scm");
-
-/// Keywords. They can't be used as variable names, which keeps desugared
-/// code from being captured by user bindings.
-const SPECIAL_FORMS: &[&str] = &[
-    "quote", "if", "and", "or", "begin", "let", "lambda", "set!", "define", "%void", "cond",
-    "else", "let*", "letrec", "letrec*", "when", "unless",
-];
-
-type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Debug)]
 enum Loc {
@@ -110,17 +107,10 @@ enum Global {
         label: String,
         closure: String,
         arity: usize,
+        rest: bool,
     },
     /// `(define x ...)`: a word in the data section
     Var { label: String },
-}
-
-pub(crate) enum Def {
-    Function {
-        params: Vec<String>,
-        body: Vec<Expr>,
-    },
-    Value(Expr),
 }
 
 /// Code generation state for the function currently being compiled.
@@ -152,6 +142,9 @@ struct Compiler {
     symbols: HashMap<String, String>,
     errors: Vec<ErrorStub>,
     prim_closures: HashMap<String, String>,
+    /// source location for error messages
+    file: String,
+    line: u32,
 }
 
 macro_rules! emit {
@@ -161,17 +154,9 @@ macro_rules! emit {
     }};
 }
 
-// after `emit!` so the submodules can use it
-mod desugar;
+// after `emit!` so the submodule can use it
 mod primitives;
-
-fn sym(s: &str) -> Expr {
-    Expr::Symbol(s.into())
-}
-
-fn list(items: Vec<Expr>) -> Expr {
-    Expr::List(items)
-}
+pub use primitives::is_primitive;
 
 /// Encode a literal as a tagged word, if it is an immediate.
 fn immediate(e: &Expr) -> Result<Option<i64>> {
@@ -185,91 +170,16 @@ fn immediate(e: &Expr) -> Result<Option<i64>> {
         Expr::Bool(false) => FALSE,
         Expr::Bool(true) => TRUE,
         Expr::Char(c) => ((*c as i64) << CHAR_SHIFT) | CHAR_TAG,
-        Expr::List(items) if items.is_empty() => EMPTY,
+        Expr::List(items, _) if items.is_empty() => EMPTY,
         _ => return Ok(None),
     }))
 }
 
-fn check_arity(name: &str, args: &[Expr], n: usize) -> Result<()> {
-    if args.len() != n {
-        return Err(format!(
-            "{name} expects {n} argument(s), got {}",
-            args.len()
-        ));
-    }
-    Ok(())
-}
-
-fn check_bindable(name: &str) -> Result<()> {
-    if SPECIAL_FORMS.contains(&name) {
-        return Err(format!(
-            "{name} is a keyword and can't be used as a variable name"
-        ));
-    }
-    Ok(())
-}
-
-fn parse_binding(b: &Expr) -> Result<(&str, &Expr)> {
-    if let Expr::List(pair) = b
-        && let [Expr::Symbol(name), rhs] = pair.as_slice()
-    {
-        check_bindable(name)?;
-        return Ok((name, rhs));
-    }
-    Err("binding must look like [name expr]".into())
-}
-
-fn parse_params(params: &[Expr]) -> Result<Vec<String>> {
-    let mut names: Vec<String> = Vec::new();
-    for p in params {
-        let Expr::Symbol(name) = p else {
-            return Err(format!("parameter must be a name, got {p:?}"));
-        };
-        check_bindable(name)?;
-        if names.contains(name) {
-            return Err(format!("duplicate parameter {name}"));
-        }
-        names.push(name.clone());
-    }
-    if names.len() > MAX_ARGS {
-        return Err(format!("at most {MAX_ARGS} parameters are supported"));
-    }
-    Ok(names)
-}
-
-/// Recognize `(define (f params...) body...)` and `(define x expr)`.
-fn parse_define(form: &Expr) -> Result<Option<(String, Def)>> {
-    let Expr::List(items) = form else {
-        return Ok(None);
-    };
-    if items.first() != Some(&sym("define")) {
-        return Ok(None);
-    }
-    match &items[1..] {
-        [Expr::List(sig), body @ ..] => {
-            let Some((Expr::Symbol(name), params)) = sig.split_first() else {
-                return Err("define needs a function name".into());
-            };
-            check_bindable(name)?;
-            let params = parse_params(params).map_err(|e| format!("{name}: {e}"))?;
-            if body.is_empty() {
-                return Err(format!("{name}: empty body"));
-            }
-            Ok(Some((
-                name.clone(),
-                Def::Function {
-                    params,
-                    body: body.to_vec(),
-                },
-            )))
-        }
-        [Expr::Symbol(name), value] => {
-            check_bindable(name)?;
-            Ok(Some((name.clone(), Def::Value(value.clone()))))
-        }
-        _ => Err(
-            "define must look like (define (name args...) body...) or (define name expr)".into(),
-        ),
+fn arity_text(n: usize, rest: bool) -> String {
+    if rest {
+        format!("at least {n}")
+    } else {
+        n.to_string()
     }
 }
 
@@ -279,7 +189,9 @@ fn all_symbols(e: &Expr, out: &mut HashSet<String>) {
         Expr::Symbol(s) => {
             out.insert(s.clone());
         }
-        Expr::List(items) => items.iter().for_each(|i| all_symbols(i, out)),
+        Expr::List(items, _) | Expr::Vector(items) => {
+            items.iter().for_each(|i| all_symbols(i, out))
+        }
         _ => {}
     }
 }
@@ -288,8 +200,8 @@ fn all_symbols(e: &Expr, out: &mut HashSet<String>) {
 fn referenced_symbols(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Symbol(s) if !out.contains(s) => out.push(s.clone()),
-        Expr::List(items) if items.first() == Some(&sym("quote")) => {}
-        Expr::List(items) => items.iter().for_each(|i| referenced_symbols(i, out)),
+        Expr::List(items, _) if items.first() == Some(&sym("quote")) => {}
+        Expr::List(items, _) => items.iter().for_each(|i| referenced_symbols(i, out)),
         _ => {}
     }
 }
@@ -298,7 +210,7 @@ fn referenced_symbols(e: &Expr, out: &mut Vec<String>) {
 /// shadowing, which can only cause an unnecessary box.)
 fn is_assigned(name: &str, body: &[Expr]) -> bool {
     body.iter().any(|e| match e {
-        Expr::List(items) => match items.as_slice() {
+        Expr::List(items, _) => match items.as_slice() {
             [Expr::Symbol(q), ..] if q == "quote" => false,
             [Expr::Symbol(s), Expr::Symbol(target), ..] if s == "set!" && target == name => true,
             _ => is_assigned(name, items),
@@ -321,6 +233,19 @@ fn asm_string(s: &str) -> String {
     out
 }
 
+/// Internal aliases: `%cons` is `cons` even if the user rebinds `cons`.
+fn primitive_name(name: &str) -> Option<&str> {
+    if is_primitive(name) {
+        return Some(name);
+    }
+    name.strip_prefix('%').filter(|p| is_primitive(p))
+}
+
+/// The user-visible name of a variable (fresh names from the expander are `name N`).
+fn display_name(name: &str) -> &str {
+    name.split(' ').next().unwrap_or(name)
+}
+
 impl Compiler {
     fn fresh(&mut self, prefix: &str) -> String {
         self.labels += 1;
@@ -331,12 +256,37 @@ impl Compiler {
         writeln!(self.f.out, "{l}:").unwrap();
     }
 
-    fn slot(&mut self, si: usize) -> Result<String> {
-        if si >= MAX_SLOTS {
-            return Err("expression too deeply nested (out of stack slots)".into());
+    // ───────────────────────────── stack slots ─────────────────────────────
+
+    fn reserve(&mut self, k: usize) -> Result<()> {
+        if k >= MAX_SLOTS {
+            return Err("function needs too many stack slots".into());
         }
-        self.f.max_slots = self.f.max_slots.max(si + 1);
-        Ok(format!("[sp, #{}]", si * 8))
+        self.f.max_slots = self.f.max_slots.max(k + 1);
+        Ok(())
+    }
+
+    /// Address of slot `k`. Big offsets go through x16.
+    fn slot_mem(&mut self, k: usize) -> String {
+        let off = k * 8;
+        if off <= 32760 {
+            format!("[sp, #{off}]")
+        } else {
+            emit!(self, "add x16, sp, #{}, lsl #12", off >> 12);
+            format!("[x16, #{}]", off & 0xfff)
+        }
+    }
+
+    fn store_slot(&mut self, reg: &str, k: usize) -> Result<()> {
+        self.reserve(k)?;
+        let m = self.slot_mem(k);
+        emit!(self, "str {reg}, {m}");
+        Ok(())
+    }
+
+    fn load_slot(&mut self, reg: &str, k: usize) {
+        let m = self.slot_mem(k);
+        emit!(self, "ldr {reg}, {m}");
     }
 
     /// Load any 64-bit constant into `reg` using movz/movk.
@@ -381,8 +331,14 @@ impl Compiler {
         }
     }
 
-    /// Label of a stub that reports `message` plus the value `culprit` puts in x1, then exits.
+    /// Label of a stub that reports `message` (with the current source
+    /// location) plus the value `culprit` puts in x1, then exits.
     fn error_label(&mut self, message: &str, culprit: &str) -> String {
+        let message = if self.line > 0 {
+            format!("{}:{}: {message}", self.file, self.line)
+        } else {
+            message.to_string()
+        };
         if let Some(e) = self
             .errors
             .iter()
@@ -393,7 +349,7 @@ impl Compiler {
         let label = format!("Lerr{}", self.errors.len());
         self.errors.push(ErrorStub {
             label: label.clone(),
-            message: message.into(),
+            message,
             culprit: culprit.into(),
         });
         label
@@ -407,14 +363,14 @@ impl Compiler {
     }
 
     /// Replace the value in slot `k` with a box containing it.
-    fn box_slot(&mut self, k: usize) {
+    fn box_slot(&mut self, k: usize) -> Result<()> {
         self.alloc(16);
-        emit!(self, "ldr x1, [sp, #{}]", k * 8);
+        self.load_slot("x1", k);
         emit!(self, "str x1, [x0]");
         self.load_imm("x1", EMPTY);
         emit!(self, "str x1, [x0, #8]");
         emit!(self, "add x0, x0, #{PAIR_TAG}");
-        emit!(self, "str x0, [sp, #{}]", k * 8);
+        self.store_slot("x0", k)
     }
 
     // ───────────────────────────── static data ─────────────────────────────
@@ -458,68 +414,79 @@ impl Compiler {
     /// Compile `e` so its value ends up in x0. `si` is the next free stack slot.
     /// If `tail`, `e` is the last thing the function does, so return its value.
     fn compile(&mut self, e: &Expr, env: &Env, si: usize, tail: bool) -> Result<()> {
+        if let Expr::List(items, Line(line)) = e
+            && !items.is_empty()
+        {
+            let outer = self.line;
+            if *line > 0 {
+                self.line = *line;
+            }
+            let r = self
+                .compile_list(items, env, si, tail)
+                .map_err(|err| at_line(self.line, err));
+            self.line = outer;
+            return r;
+        }
         if let Some(imm) = immediate(e)? {
             self.load_imm("x0", imm);
             self.ret_if(tail);
             return Ok(());
         }
         match e {
-            Expr::Symbol(name) => {
-                self.compile_variable(name, env)?;
-                self.ret_if(tail);
-                Ok(())
-            }
+            Expr::Symbol(name) => self.compile_variable(name, env)?,
             Expr::Str(s) => {
                 let label = self.static_bytes("scm_str", s.as_bytes());
                 self.load_address("x0", &label, STRING_TAG);
-                {
-                    self.ret_if(tail);
-                    Ok(())
-                }
             }
-            Expr::List(items) => {
-                let (op, args) = items.split_first().unwrap(); // `()` is an immediate
-                if let Expr::Symbol(head) = op {
-                    if SPECIAL_FORMS.contains(&head.as_str()) {
-                        return self.compile_special(head, args, env, si, tail);
+            Expr::Vector(_) => self.compile_quoted(e, si)?,
+            _ => unreachable!("immediates and lists handled above"),
+        }
+        self.ret_if(tail);
+        Ok(())
+    }
+
+    fn compile_list(&mut self, items: &[Expr], env: &Env, si: usize, tail: bool) -> Result<()> {
+        let (op, args) = items.split_first().unwrap();
+        if let Expr::Symbol(head) = op {
+            if SPECIAL_FORMS.contains(&head.as_str()) {
+                return self.compile_special(head, args, env, si, tail);
+            }
+            if lookup(env, head).is_none() {
+                match self.globals.get(head) {
+                    Some(Global::Func {
+                        label, arity, rest, ..
+                    }) => {
+                        let (label, arity, rest) = (label.clone(), *arity, *rest);
+                        return self
+                            .compile_direct_call(head, &label, arity, rest, args, env, si, tail);
                     }
-                    if lookup(env, head).is_none() {
-                        match self.globals.get(head) {
-                            Some(Global::Func { label, arity, .. }) => {
-                                let (label, arity) = (label.clone(), *arity);
-                                return self
-                                    .compile_direct_call(head, &label, arity, args, env, si, tail);
-                            }
-                            None if primitives::is_primitive(head) => {
-                                self.compile_primitive(head, args, env, si)?;
-                                self.ret_if(tail);
-                                return Ok(());
-                            }
-                            _ => {}
+                    Some(Global::Var { .. }) => {}
+                    None if head == "apply" => return self.compile_apply(args, env, si, tail),
+                    None => {
+                        if let Some(prim) = primitive_name(head) {
+                            self.compile_primitive(prim, args, env, si)?;
+                            self.ret_if(tail);
+                            return Ok(());
                         }
                     }
                 }
-                self.compile_call(op, args, env, si, tail)
             }
-            _ => unreachable!("immediates handled above"),
         }
+        self.compile_call(op, args, env, si, tail)
     }
 
     /// Load a local's slot or closure field into `reg`, without unboxing.
     fn load_raw(&mut self, local: &Local, reg: &str) {
         match local.loc {
-            Loc::Slot(k) => emit!(self, "ldr {reg}, [sp, #{}]", k * 8),
+            Loc::Slot(k) => self.load_slot(reg, k),
             Loc::Free(i) => {
                 let cs = self
                     .f
                     .closure_slot
                     .expect("free variable without a closure");
-                emit!(self, "ldr {reg}, [sp, #{}]", cs * 8);
-                emit!(
-                    self,
-                    "ldr {reg}, [{reg}, #{}]",
-                    16 + 8 * i - CLOSURE_TAG as usize
-                );
+                self.load_slot(reg, cs);
+                emit!(self, "sub {reg}, {reg}, #{CLOSURE_TAG}");
+                emit!(self, "ldr {reg}, [{reg}, #{}]", 16 + 8 * i);
             }
         }
     }
@@ -548,30 +515,45 @@ impl Compiler {
                 self.load_address("x0", &closure, CLOSURE_TAG);
                 Ok(())
             }
-            None if primitives::is_primitive(name) => {
-                let closure = self.primitive_closure(name)?;
-                self.load_address("x0", &closure, CLOSURE_TAG);
-                Ok(())
+            None => {
+                // variadic primitives and apply as values are library functions (%+ etc.)
+                let lib = format!("%{name}");
+                if let Some(Global::Func { closure, .. }) = self.globals.get(&lib) {
+                    let closure = closure.clone();
+                    self.load_address("x0", &closure, CLOSURE_TAG);
+                    return Ok(());
+                }
+                if let Some(prim) = primitive_name(name) {
+                    let closure = self.primitive_closure(prim)?;
+                    self.load_address("x0", &closure, CLOSURE_TAG);
+                    return Ok(());
+                }
+                if SPECIAL_FORMS.contains(&name) {
+                    return Err(format!("bad syntax: {name} used as a value"));
+                }
+                Err(format!("unbound variable: {}", display_name(name)))
             }
-            None if SPECIAL_FORMS.contains(&name) => {
-                Err(format!("bad syntax: {name} used as a value"))
-            }
-            None => Err(format!("unbound variable: {name}")),
         }
     }
 
-    /// Using a primitive like `car` as a value: wrap it in a function once.
+    /// Using a fixed-arity primitive like `car` as a value: wrap it in a function once.
     fn primitive_closure(&mut self, name: &str) -> Result<String> {
         if let Some(l) = self.prim_closures.get(name) {
             return Ok(l.clone());
         }
         let arity = primitives::value_arity(name)
-            .ok_or_else(|| format!("{name} can't be used as a value yet"))?;
-        let params: Vec<String> = (0..arity).map(|i| format!("arg {i}")).collect();
+            .ok_or_else(|| format!("{name} can't be used as a value"))?;
+        let params = Params {
+            fixed: (0..arity).map(|i| format!("arg {i}")).collect(),
+            rest: None,
+        };
         let mut call = vec![sym(name)];
-        call.extend(params.iter().map(|p| sym(p)));
+        call.extend(params.fixed.iter().map(|p| sym(p)));
         let code = self.fresh("scm_prim");
-        self.compile_function(&code, name, &params, &[], &[list(call)], true)?;
+        let line = std::mem::take(&mut self.line); // errors inside report no line
+        let r = self.compile_function(&code, name, &params, &[], &[list(call)], true);
+        self.line = line;
+        r?;
         let closure = self.static_closure(&code);
         self.prim_closures.insert(name.to_string(), closure.clone());
         Ok(closure)
@@ -581,18 +563,31 @@ impl Compiler {
     fn args_to_slots(&mut self, args: &[Expr], env: &Env, base: usize) -> Result<()> {
         for (i, a) in args.iter().enumerate() {
             self.compile(a, env, base + i, false)?;
-            let slot = self.slot(base + i)?;
-            emit!(self, "str x0, {slot}");
+            self.store_slot("x0", base + i)?;
         }
         Ok(())
     }
 
-    /// Load slots `base..base+n` into x0..x(n-1) and the argument count into x9.
-    fn load_args(&mut self, base: usize, n: usize) {
-        for i in 0..n {
-            emit!(self, "ldr x{i}, [sp, #{}]", (base + i) * 8);
+    /// Pass the `n` arguments in slots `base..`: the first 8 in x0..x7, the
+    /// rest in `scm_argbuf[8..]`; the count goes in x9.
+    fn load_args(&mut self, base: usize, n: usize) -> Result<()> {
+        if n > MAX_CALL_ARGS {
+            return Err(format!(
+                "at most {MAX_CALL_ARGS} arguments in one call (use apply for more)"
+            ));
+        }
+        if n > REG_ARGS {
+            self.load_address("x11", "_scm_argbuf", 0);
+            for i in REG_ARGS..n {
+                self.load_slot("x10", base + i);
+                emit!(self, "str x10, [x11, #{}]", 8 * i);
+            }
+        }
+        for i in 0..n.min(REG_ARGS) {
+            self.load_slot(&format!("x{i}"), base + i);
         }
         emit!(self, "mov x9, #{n}");
+        Ok(())
     }
 
     /// Call a top-level `(define (f ...))` by label (no closure needed).
@@ -602,14 +597,21 @@ impl Compiler {
         name: &str,
         label: &str,
         arity: usize,
+        rest: bool,
         args: &[Expr],
         env: &Env,
         si: usize,
         tail: bool,
     ) -> Result<()> {
-        check_arity(name, args, arity)?;
+        if args.len() < arity || (!rest && args.len() > arity) {
+            return Err(format!(
+                "{name} expects {} argument(s), got {}",
+                arity_text(arity, rest),
+                args.len()
+            ));
+        }
         self.args_to_slots(args, env, si)?;
-        self.load_args(si, args.len());
+        self.load_args(si, args.len())?;
         if tail {
             self.emit_teardown();
             emit!(self, "b {label}");
@@ -617,6 +619,25 @@ impl Compiler {
             emit!(self, "bl {label}");
         }
         Ok(())
+    }
+
+    /// x8 = the closure in slot `k`; x10 = its code. Errors if it isn't a procedure.
+    fn load_callee(&mut self, k: usize) {
+        self.load_slot("x8", k);
+        let err = self.error_label("application: not a procedure:", "mov x1, x8");
+        emit!(self, "and x10, x8, #7");
+        emit!(self, "cmp x10, #{CLOSURE_TAG}");
+        emit!(self, "b.ne {err}");
+        emit!(self, "ldur x10, [x8, #-{CLOSURE_TAG}]");
+    }
+
+    fn emit_jump_to_callee(&mut self, tail: bool) {
+        if tail {
+            self.emit_teardown();
+            emit!(self, "br x10");
+        } else {
+            emit!(self, "blr x10");
+        }
     }
 
     /// Call whatever closure `op` evaluates to.
@@ -628,33 +649,55 @@ impl Compiler {
         si: usize,
         tail: bool,
     ) -> Result<()> {
-        if args.len() > MAX_ARGS {
-            return Err(format!("at most {MAX_ARGS} arguments are supported"));
-        }
         self.compile(op, env, si, false)?;
-        let op_slot = self.slot(si)?;
-        emit!(self, "str x0, {op_slot}");
+        self.store_slot("x0", si)?;
         self.args_to_slots(args, env, si + 1)?;
-        self.load_args(si + 1, args.len());
-        emit!(self, "ldr x8, {op_slot}");
-        let err = self.error_label("application: not a procedure:", "mov x1, x8");
-        emit!(self, "and x10, x8, #7");
-        emit!(self, "cmp x10, #{CLOSURE_TAG}");
-        emit!(self, "b.ne {err}");
-        emit!(self, "ldur x10, [x8, #-{CLOSURE_TAG}]");
-        if tail {
-            self.emit_teardown();
-            emit!(self, "br x10");
-        } else {
-            emit!(self, "blr x10");
+        self.load_args(si + 1, args.len())?;
+        self.load_callee(si);
+        self.emit_jump_to_callee(tail);
+        Ok(())
+    }
+
+    /// `(apply f a... list)`: spread the arguments into the argument buffer.
+    fn compile_apply(&mut self, args: &[Expr], env: &Env, si: usize, tail: bool) -> Result<()> {
+        if args.len() < 2 {
+            return Err("apply expects a procedure and a list".into());
         }
+        self.args_to_slots(args, env, si)?;
+        let fixed = args.len() - 2;
+        self.load_address("x11", "_scm_argbuf", 0);
+        for j in 0..fixed {
+            self.load_slot("x10", si + 1 + j);
+            emit!(self, "str x10, [x11, #{}]", 8 * j);
+        }
+        self.load_slot("x12", si + args.len() - 1);
+        emit!(self, "mov x9, #{fixed}");
+        let (top, done) = (self.fresh("L"), self.fresh("L"));
+        let not_list = self.error_label("apply: expected a list, got", "mov x1, x12");
+        let too_many = self.error_label(&format!("apply: more than {ARGBUF_SIZE} arguments"), "");
+        self.label(&top);
+        emit!(self, "cmp x12, #{EMPTY}");
+        emit!(self, "b.eq {done}");
+        emit!(self, "and x10, x12, #7");
+        emit!(self, "cmp x10, #{PAIR_TAG}");
+        emit!(self, "b.ne {not_list}");
+        emit!(self, "cmp x9, #{}, lsl #12", ARGBUF_SIZE >> 12);
+        emit!(self, "b.hs {too_many}");
+        emit!(self, "ldur x10, [x12, #-{PAIR_TAG}]");
+        emit!(self, "str x10, [x11, x9, lsl #3]");
+        emit!(self, "ldur x12, [x12, #{}]", 8 - PAIR_TAG);
+        emit!(self, "add x9, x9, #1");
+        emit!(self, "b {top}");
+        self.label(&done);
+        for i in (0..REG_ARGS).step_by(2) {
+            emit!(self, "ldp x{}, x{}, [x11, #{}]", i, i + 1, 8 * i);
+        }
+        self.load_callee(si);
+        self.emit_jump_to_callee(tail);
         Ok(())
     }
 
     fn compile_body(&mut self, body: &[Expr], env: &Env, si: usize, tail: bool) -> Result<()> {
-        if let Some(e) = desugar::internal_defines(body)? {
-            return self.compile(&e, env, si, tail);
-        }
         let Some((last, init)) = body.split_last() else {
             return Err("empty body".into());
         };
@@ -664,7 +707,7 @@ impl Compiler {
         self.compile(last, env, si, tail)
     }
 
-    /// A quoted datum. Lists are built fresh each time they're evaluated.
+    /// A quoted datum. Lists and vectors are built fresh each time they're evaluated.
     fn compile_quoted(&mut self, datum: &Expr, si: usize) -> Result<()> {
         if let Some(imm) = immediate(datum)? {
             self.load_imm("x0", imm);
@@ -676,13 +719,29 @@ impl Compiler {
                 self.load_address("x0", &label, SYMBOL_TAG);
             }
             Expr::Str(_) => self.compile(datum, &Env::new(), si, false)?,
-            Expr::List(items) => {
+            Expr::List(items, _) => {
+                let n = items.len();
+                let dotted = n >= 3 && items[n - 2] == sym(".");
+                let elems = if dotted { &items[..n - 2] } else { &items[..] };
+                for (i, item) in elems.iter().enumerate() {
+                    self.compile_quoted(item, si + i)?;
+                    self.store_slot("x0", si + i)?;
+                }
+                let tail = if dotted {
+                    self.compile_quoted(&items[n - 1], si + elems.len())?;
+                    self.store_slot("x0", si + elems.len())?;
+                    Some(si + elems.len())
+                } else {
+                    None
+                };
+                self.list_from_slots(si, elems.len(), tail)?;
+            }
+            Expr::Vector(items) => {
                 for (i, item) in items.iter().enumerate() {
                     self.compile_quoted(item, si + i)?;
-                    let slot = self.slot(si + i)?;
-                    emit!(self, "str x0, {slot}");
+                    self.store_slot("x0", si + i)?;
                 }
-                self.list_from_slots(si, items.len());
+                self.vector_from_slots(si, items.len())?;
             }
             _ => unreachable!("immediates handled above"),
         }
@@ -697,24 +756,17 @@ impl Compiler {
         si: usize,
         tail: bool,
     ) -> Result<()> {
-        if let Some(expanded) = desugar::derived(head, args)? {
-            return self.compile(&expanded, env, si, tail);
-        }
         match head {
             "quote" => {
-                check_arity("quote", args, 1)?;
-                self.compile_quoted(&args[0], si)?;
-                {
-                    self.ret_if(tail);
-                    Ok(())
-                }
+                let [datum] = args else {
+                    return Err("quote expects 1 argument".into());
+                };
+                self.compile_quoted(datum, si)?;
+                self.ret_if(tail);
             }
             "%void" => {
                 self.load_imm("x0", VOID);
-                {
-                    self.ret_if(tail);
-                    Ok(())
-                }
+                self.ret_if(tail);
             }
             "if" => {
                 if !(2..=3).contains(&args.len()) {
@@ -734,7 +786,6 @@ impl Compiler {
                     None => self.compile_special("%void", &[], env, si, tail)?,
                 }
                 self.label(&end_l);
-                Ok(())
             }
             "and" | "or" => {
                 if args.is_empty() {
@@ -755,11 +806,15 @@ impl Compiler {
                 if !init.is_empty() {
                     self.ret_if(tail);
                 }
-                Ok(())
             }
-            "begin" => self.compile_body(args, env, si, tail),
+            "begin" => {
+                if args.is_empty() {
+                    return self.compile_special("%void", &[], env, si, tail);
+                }
+                self.compile_body(args, env, si, tail)?;
+            }
             "let" => {
-                let [Expr::List(bindings), body @ ..] = args else {
+                let [Expr::List(bindings, _), body @ ..] = args else {
                     return Err("let expects a binding list and a body".into());
                 };
                 // all right-hand sides see the *outer* env; each result gets its own slot
@@ -768,15 +823,14 @@ impl Compiler {
                 for (i, b) in bindings.iter().enumerate() {
                     let (name, rhs) = parse_binding(b)?;
                     if names.contains(&name) {
-                        return Err(format!("let: duplicate binding {name}"));
+                        return Err(format!("let: duplicate binding {}", display_name(name)));
                     }
                     names.push(name);
                     self.compile(rhs, env, si + i, false)?;
-                    let slot = self.slot(si + i)?;
-                    emit!(self, "str x0, {slot}");
+                    self.store_slot("x0", si + i)?;
                     let boxed = is_assigned(name, body);
                     if boxed {
-                        self.box_slot(si + i);
+                        self.box_slot(si + i)?;
                     }
                     new_env.push(Local {
                         name: name.to_string(),
@@ -784,21 +838,15 @@ impl Compiler {
                         boxed,
                     });
                 }
-                self.compile_body(body, &new_env, si + bindings.len(), tail)
+                self.compile_body(body, &new_env, si + bindings.len(), tail)?;
             }
             "lambda" => {
-                let [Expr::List(params), body @ ..] = args else {
-                    return Err("lambda expects a parameter list and a body (rest parameters aren't supported yet)".into());
+                let [params, body @ ..] = args else {
+                    return Err("lambda expects a parameter list and a body".into());
                 };
-                if body.is_empty() {
-                    return Err("lambda: empty body".into());
-                }
                 let params = parse_params(params)?;
                 self.compile_lambda(&params, body, env)?;
-                {
-                    self.ret_if(tail);
-                    Ok(())
-                }
+                self.ret_if(tail);
             }
             "set!" => {
                 let [Expr::Symbol(name), rhs] = args else {
@@ -819,31 +867,28 @@ impl Compiler {
                         Some(Global::Func { .. }) => {
                             return Err(format!("can't set! {name}: it was defined as a function"));
                         }
-                        None => return Err(format!("set!: unbound variable: {name}")),
+                        None => {
+                            return Err(format!("set!: unbound variable: {}", display_name(name)));
+                        }
                     }
                 }
                 self.load_imm("x0", VOID);
-                {
-                    self.ret_if(tail);
-                    Ok(())
-                }
+                self.ret_if(tail);
             }
-            "define" => {
-                Err("define is only allowed at the top level or the start of a body".into())
-            }
-            _ => Err(format!("bad syntax: {head}")),
+            _ => return Err(format!("bad syntax: {head}")),
         }
+        Ok(())
     }
 
     /// Emit the lambda's code as a separate function, and code here that
     /// creates its closure in x0.
-    fn compile_lambda(&mut self, params: &[String], body: &[Expr], env: &Env) -> Result<()> {
+    fn compile_lambda(&mut self, params: &Params, body: &[Expr], env: &Env) -> Result<()> {
         let mut referenced = Vec::new();
         body.iter()
             .for_each(|e| referenced_symbols(e, &mut referenced));
         let free: Vec<Local> = referenced
             .iter()
-            .filter(|s| !params.contains(s))
+            .filter(|s| !params.all().any(|p| p == *s))
             .filter_map(|s| lookup(env, s).cloned())
             .collect();
 
@@ -859,11 +904,16 @@ impl Compiler {
         self.alloc((16 + 8 * free.len()).div_ceil(16) * 16);
         emit!(self, "adr x1, {code}");
         emit!(self, "str x1, [x0]");
-        emit!(self, "mov x1, #{}", free.len());
+        self.load_imm("x1", free.len() as i64);
         emit!(self, "str x1, [x0, #8]");
         for (j, local) in free.iter().enumerate() {
             self.load_raw(local, "x1"); // captures the box itself if boxed
-            emit!(self, "str x1, [x0, #{}]", 16 + 8 * j);
+            if 16 + 8 * j <= 32760 {
+                emit!(self, "str x1, [x0, #{}]", 16 + 8 * j);
+            } else {
+                self.load_imm("x2", (16 + 8 * j) as i64);
+                emit!(self, "str x1, [x0, x2]");
+            }
         }
         emit!(self, "add x0, x0, #{CLOSURE_TAG}");
         Ok(())
@@ -875,29 +925,38 @@ impl Compiler {
         &mut self,
         label: &str,
         name: &str,
-        params: &[String],
+        params: &Params,
         free: &[Local],
         body: &[Expr],
         check_arity: bool,
     ) -> Result<()> {
         let outer = std::mem::take(&mut self.f);
-        let result = self.compile_function_body(params, free, body);
-        if let Err(e) = result {
+        if let Err(e) = self.compile_function_body(params, free, body) {
             self.f = outer;
             return Err(e);
         }
         let body_asm = std::mem::take(&mut self.f.out);
         let frame = (self.f.max_slots * 8).div_ceil(16) * 16; // sp must stay 16-byte aligned
 
-        writeln!(self.f.out, "\n    .p2align 2\n{label}:  // {name}").unwrap();
+        writeln!(
+            self.f.out,
+            "\n    .p2align 2\n{label}:  // {}",
+            display_name(name)
+        )
+        .unwrap();
         if check_arity {
-            let n = params.len();
+            let n = params.fixed.len();
+            let rest = params.rest.is_some();
             let err = self.error_label(
-                &format!("{name}: expected {n} argument(s), got"),
+                &format!(
+                    "{}: expected {} argument(s), got",
+                    display_name(name),
+                    arity_text(n, rest)
+                ),
                 "lsl x1, x9, #2",
             );
             emit!(self, "cmp x9, #{n}");
-            emit!(self, "b.ne {err}");
+            emit!(self, "{} {err}", if rest { "b.lo" } else { "b.ne" });
         }
         emit!(self, "stp x29, x30, [sp, #-16]!");
         emit!(self, "mov x29, sp");
@@ -926,24 +985,46 @@ impl Compiler {
 
     fn compile_function_body(
         &mut self,
-        params: &[String],
+        params: &Params,
         free: &[Local],
         body: &[Expr],
     ) -> Result<()> {
+        let n = params.fixed.len();
         let mut env = Env::new();
-        for (i, p) in params.iter().enumerate() {
-            let slot = self.slot(i)?;
-            emit!(self, "str x{i}, {slot}");
+        for (i, p) in params.all().enumerate() {
             env.push(Local {
                 name: p.clone(),
                 loc: Loc::Slot(i),
                 boxed: is_assigned(p, body),
             });
         }
-        let mut si = params.len();
+
+        // copy the arguments into slots before anything can allocate
+        if params.rest.is_some() {
+            // spill the register arguments so all of them are in the buffer
+            self.load_address("x11", "_scm_argbuf", 0);
+            for i in (0..REG_ARGS).step_by(2) {
+                emit!(self, "stp x{}, x{}, [x11, #{}]", i, i + 1, 8 * i);
+            }
+            for i in 0..n {
+                emit!(self, "ldr x10, [x11, #{}]", 8 * i);
+                self.store_slot("x10", i)?;
+            }
+        } else {
+            for i in 0..n.min(REG_ARGS) {
+                self.store_slot(&format!("x{i}"), i)?;
+            }
+            if n > REG_ARGS {
+                self.load_address("x11", "_scm_argbuf", 0);
+                for i in REG_ARGS..n {
+                    emit!(self, "ldr x10, [x11, #{}]", 8 * i);
+                    self.store_slot("x10", i)?;
+                }
+            }
+        }
+        let mut si = params.all().count();
         if !free.is_empty() {
-            let slot = self.slot(si)?;
-            emit!(self, "str x8, {slot}");
+            self.store_slot("x8", si)?;
             self.f.closure_slot = Some(si);
             si += 1;
             for (j, local) in free.iter().enumerate() {
@@ -954,61 +1035,171 @@ impl Compiler {
                 });
             }
         }
-        let boxed: Vec<usize> = (0..params.len()).filter(|&i| env[i].boxed).collect();
+        if params.rest.is_some() {
+            self.collect_rest_args(n)?;
+        }
+        let boxed: Vec<usize> = (0..params.all().count())
+            .filter(|&i| env[i].boxed)
+            .collect();
         for i in boxed {
-            self.box_slot(i);
+            self.box_slot(i)?;
         }
         self.compile_body(body, &env, si, true)
     }
+
+    /// Turn arguments `n..x9` (in `scm_argbuf`) into a list in slot `n`.
+    /// The GC treats `scm_argbuf[0..scm_argbuf_live]` as roots meanwhile.
+    fn collect_rest_args(&mut self, n: usize) -> Result<()> {
+        let (empty, done, top) = (self.fresh("L"), self.fresh("L"), self.fresh("L"));
+        emit!(self, "lsl x10, x9, #{FIXNUM_SHIFT}");
+        self.store_slot("x10", n)?; // the count, as a fixnum, survives the allocation
+        emit!(self, "cmp x9, #{n}");
+        emit!(self, "b.eq {empty}");
+        self.load_address("x12", "_scm_argbuf_live", 0);
+        emit!(self, "str x9, [x12]");
+        emit!(self, "sub x10, x9, #{n}");
+        emit!(self, "lsl x10, x10, #4"); // 16 bytes per pair
+        emit!(self, "bl scm_alloc");
+        self.load_slot("x12", n);
+        emit!(self, "asr x12, x12, #{FIXNUM_SHIFT}");
+        self.load_address("x14", "_scm_argbuf", 0);
+        emit!(self, "mov x13, #{n}");
+        emit!(self, "mov x15, x0");
+        self.label(&top);
+        emit!(self, "ldr x1, [x14, x13, lsl #3]");
+        emit!(self, "add x2, x15, #{}", 16 + PAIR_TAG);
+        emit!(self, "stp x1, x2, [x15], #16");
+        emit!(self, "add x13, x13, #1");
+        emit!(self, "cmp x13, x12");
+        emit!(self, "b.lo {top}");
+        self.load_imm("x2", EMPTY);
+        emit!(self, "stur x2, [x15, #-8]"); // the last cdr
+        emit!(self, "add x0, x0, #{PAIR_TAG}");
+        self.load_address("x12", "_scm_argbuf_live", 0);
+        emit!(self, "str xzr, [x12]");
+        emit!(self, "b {done}");
+        self.label(&empty);
+        self.load_imm("x0", EMPTY);
+        self.label(&done);
+        self.store_slot("x0", n)
+    }
 }
 
-/// Compile a whole program: top-level `define`s and expressions, evaluated in
-/// order; the value of the last expression is printed.
-///
-/// Produces an assembly file defining `value scheme_entry(void *heap, void *heap_end)`.
-pub fn compile_program(forms: &[Expr]) -> Result<String> {
-    let mut c = Compiler::default();
+/// Variadic primitives and `apply` used as values are these library functions.
+const VALUE_WRAPPERS: &[&str] = &["+", "-", "*", "list", "vector", "apply"];
 
-    // ── classify top-level forms
-    let mut defs: Vec<(String, Def)> = Vec::new();
-    let mut main_body = Vec::new();
-    for form in forms {
-        match parse_define(form)? {
-            Some((name, def)) => {
-                if defs.iter().any(|(n, _)| *n == name) {
-                    return Err(format!("{name} is defined twice"));
-                }
-                if let Def::Value(e) = &def {
-                    main_body.push(list(vec![sym("set!"), sym(&name), e.clone()]));
-                }
-                defs.push((name, def));
-            }
-            None => main_body.push(form.clone()),
+/// Compile a whole program: top-level definitions and expressions,
+/// evaluated in order; the value of the last expression is printed.
+/// `file` is used in error messages.
+///
+/// Produces an assembly file defining
+/// `value scheme_entry(void *heap, void *heap_end, void *stack_top)`.
+pub fn compile_program(forms: &[Expr], file: &str) -> Result<String> {
+    let mut ex = Expander::default();
+    let prelude_forms = reader::read_all(PRELUDE).expect("prelude parses");
+
+    // ── macros first, so they can be used before their definition
+    let mut rest = Vec::new();
+    for f in forms {
+        if !ex.define_macro(f)? {
+            rest.push(f.clone());
         }
     }
+
+    // ── top-level forms: expand head macros, splice begins, find definitions
+    let mut flat = Vec::new();
+    for f in &rest {
+        ex.flatten_into(f, &mut flat)?;
+    }
+    let mut user_defs: Vec<(String, Def, u32)> = Vec::new();
+    let mut main_raw: Vec<Expr> = Vec::new();
+    for form in &flat {
+        if head_is_define_syntax(form) {
+            return Err(at_line(
+                line_of(form),
+                "define-syntax produced by a macro isn't supported".into(),
+            ));
+        }
+        match parse_define(form)? {
+            Some((name, def)) => {
+                if ex.is_macro(&name) {
+                    return Err(at_line(line_of(form), format!("{name} is already a macro")));
+                }
+                if user_defs.iter().any(|(n, ..)| *n == name) {
+                    return Err(at_line(line_of(form), format!("{name} is defined twice")));
+                }
+                if let Def::Value(e) = &def {
+                    main_raw.push(Expr::List(
+                        vec![sym("set!"), sym(&name), e.clone()],
+                        Line(line_of(form)),
+                    ));
+                }
+                user_defs.push((name, def, line_of(form)));
+            }
+            None => main_raw.push(form.clone()),
+        }
+    }
+    let prelude_defs: Vec<(String, Def, u32)> = prelude_forms
+        .iter()
+        .map(|f| {
+            let (n, d) = parse_define(f)
+                .expect("prelude is valid")
+                .expect("prelude has only defines");
+            (n, d, line_of(f))
+        })
+        .collect();
+
+    // ── expand everything into core forms
+    let expand_def = |ex: &mut Expander, def: Def| -> Result<Def> {
+        Ok(match def {
+            Def::Function { params, body } => Def::Function {
+                params,
+                body: ex.expand_body(&body)?,
+            },
+            Def::Value(e) => Def::Value(ex.expand(&e)?),
+        })
+    };
+    let mut defs = Vec::new();
+    for (name, def, line) in user_defs {
+        defs.push((name, expand_def(&mut ex, def)?, line, false));
+    }
+    let mut main_body = main_raw
+        .iter()
+        .map(|e| ex.expand(e))
+        .collect::<Result<Vec<_>>>()?;
     if main_body.is_empty() {
         main_body.push(list(vec![sym("%void")]));
     }
 
     // ── pull in the prelude definitions the program uses (transitively)
-    let prelude: Vec<(String, Def)> = reader::read_all(PRELUDE)
-        .expect("prelude parses")
-        .iter()
-        .map(|f| {
-            parse_define(f)
-                .expect("prelude is valid")
-                .expect("prelude has only defines")
-        })
-        .collect();
     let mut used = HashSet::new();
-    forms.iter().for_each(|f| all_symbols(f, &mut used));
+    main_body.iter().for_each(|e| all_symbols(e, &mut used));
+    for (_, def, ..) in &defs {
+        match def {
+            Def::Function { body, .. } => body.iter().for_each(|e| all_symbols(e, &mut used)),
+            Def::Value(e) => all_symbols(e, &mut used),
+        }
+    }
+    let mut prelude: Vec<(String, Def, u32)> = Vec::new();
+    for (name, def, line) in prelude_defs {
+        prelude.push((
+            name,
+            expand_def(&mut ex, def).expect("prelude expands"),
+            line,
+        ));
+    }
     let mut included = HashSet::new();
     loop {
         let before = included.len();
-        for (name, def) in &prelude {
+        for w in VALUE_WRAPPERS {
+            if used.contains(*w) {
+                used.insert(format!("%{w}"));
+            }
+        }
+        for (name, def, _) in &prelude {
             if used.contains(name)
                 && !included.contains(name)
-                && !defs.iter().any(|(n, _)| n == name)
+                && !defs.iter().any(|(n, ..)| n == name)
             {
                 included.insert(name.clone());
                 if let Def::Function { body, .. } = def {
@@ -1020,11 +1211,20 @@ pub fn compile_program(forms: &[Expr]) -> Result<String> {
             break;
         }
     }
-    defs.extend(prelude.into_iter().filter(|(n, _)| included.contains(n)));
+    defs.extend(
+        prelude
+            .into_iter()
+            .filter(|(n, ..)| included.contains(n))
+            .map(|(n, d, l)| (n, d, l, true)),
+    );
 
     // ── register globals so every function can see every other
+    let mut c = Compiler {
+        file: file.to_string(),
+        ..Default::default()
+    };
     let mut labels = Vec::new();
-    for (name, def) in &defs {
+    for (name, def, ..) in &defs {
         let global = match def {
             Def::Function { params, .. } => {
                 let label = c.fresh("scm_fn");
@@ -1033,7 +1233,8 @@ pub fn compile_program(forms: &[Expr]) -> Result<String> {
                 Global::Func {
                     label,
                     closure,
-                    arity: params.len(),
+                    arity: params.fixed.len(),
+                    rest: params.rest.is_some(),
                 }
             }
             Def::Value(_) => {
@@ -1047,15 +1248,32 @@ pub fn compile_program(forms: &[Expr]) -> Result<String> {
     }
 
     // ── code
-    c.compile_function("scm_main", "program", &[], &[], &main_body, false)?;
-    for ((name, def), label) in defs.iter().zip(&labels) {
+    let no_params = Params {
+        fixed: vec![],
+        rest: None,
+    };
+    c.compile_function("scm_main", "program", &no_params, &[], &main_body, false)?;
+    for ((name, def, line, from_prelude), label) in defs.iter().zip(&labels) {
         if let Def::Function { params, body } = def {
+            c.file = if *from_prelude {
+                "prelude".into()
+            } else {
+                file.to_string()
+            };
+            c.line = *line;
             c.compile_function(label, name, params, &[], body, true)
-                .map_err(|e| format!("in {name}: {e}"))?;
+                .map_err(|e| at_line(*line, e))?;
         }
     }
 
-    // ── assemble the file
+    Ok(assemble(c))
+}
+
+fn head_is_define_syntax(e: &Expr) -> bool {
+    matches!(e, Expr::List(items, _) if items.first() == Some(&sym("define-syntax")))
+}
+
+fn assemble(c: Compiler) -> String {
     let mut out = String::new();
     out.push_str(RUNTIME_GLUE);
     out.push_str(&c.text);
@@ -1083,32 +1301,55 @@ pub fn compile_program(forms: &[Expr]) -> Result<String> {
         )
         .unwrap();
     }
-    out.push_str(
-        "\n    .data\n    .p2align 3\n    .globl _scm_stack_base\n_scm_stack_base:\n    .quad 0\n",
-    );
+    out.push_str("\n    .data\n    .p2align 3\n");
+    out.push_str("    .globl _scm_stack_base\n_scm_stack_base:\n    .quad 0\n");
+    out.push_str("    .globl _scm_argbuf_live\n_scm_argbuf_live:\n    .quad 0\n");
     out.push_str(
         "    .globl _scm_globals_start\n    .globl _scm_globals_end\n_scm_globals_start:\n",
     );
     out.push_str(&c.globals_data);
     out.push_str("_scm_globals_end:\n");
+    // every static symbol, so string->symbol can find them
+    out.push_str(
+        "    .globl _scm_symbols_start\n    .globl _scm_symbols_end\n_scm_symbols_start:\n",
+    );
+    let mut syms: Vec<&String> = c.symbols.values().collect();
+    syms.sort();
+    for l in syms {
+        writeln!(out, "    .quad {l}+{SYMBOL_TAG}").unwrap();
+    }
+    out.push_str("_scm_symbols_end:\n");
     out.push_str(&c.data);
-    Ok(out)
+    writeln!(
+        out,
+        "\n    .globl _scm_argbuf\n    .zerofill __DATA,__bss,_scm_argbuf,{},4",
+        ARGBUF_SIZE * 8
+    )
+    .unwrap();
+    out
 }
 
 /// The entry point (C calling convention) and the allocator.
 const RUNTIME_GLUE: &str = r#"    .text
     .globl _scheme_entry
     .p2align 2
-// value scheme_entry(void *heap, void *heap_end)
+// value scheme_entry(void *heap, void *heap_end, void *stack_top)
+// Runs the program on its own (big) stack.
 _scheme_entry:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     stp x27, x28, [sp, #-16]!     // callee-saved in C
-    adrp x9, _scm_stack_base@PAGE
-    str x29, [x9, _scm_stack_base@PAGEOFF]   // the GC stops walking frames here
     mov x28, x0
     mov x27, x1
+    mov x9, sp
+    mov sp, x2                    // switch to the Scheme stack
+    stp x9, xzr, [sp, #-16]!      // remember the C stack
+    mov x29, sp
+    adrp x10, _scm_stack_base@PAGE
+    str x29, [x10, _scm_stack_base@PAGEOFF]   // the GC stops walking frames here
     bl scm_main
+    ldr x9, [sp]
+    mov sp, x9                    // back to the C stack
     ldp x27, x28, [sp], #16
     ldp x29, x30, [sp], #16
     ret

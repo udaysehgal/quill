@@ -6,10 +6,11 @@ use super::*;
 fn arity(name: &str) -> Option<(usize, Option<usize>)> {
     Some(match name {
         "newline" => (0, Some(0)),
+        "exit" => (0, Some(1)),
         "add1" | "sub1" | "zero?" | "null?" | "not" | "integer?" | "boolean?" | "char?"
         | "pair?" | "procedure?" | "vector?" | "string?" | "symbol?" | "char->integer"
         | "integer->char" | "car" | "cdr" | "vector-length" | "string-length" | "display"
-        | "write" | "%symbol-chars" => (1, Some(1)),
+        | "write" | "string->symbol" | "%symbol-chars" => (1, Some(1)),
         "=" | "<" | ">" | "<=" | ">=" | "eq?" | "eqv?" | "cons" | "quotient" | "remainder"
         | "modulo" | "vector-ref" | "string-ref" | "set-car!" | "set-cdr!" | "char=?"
         | "char<?" | "char>?" | "char<=?" | "char>=?" => (2, Some(2)),
@@ -21,16 +22,17 @@ fn arity(name: &str) -> Option<(usize, Option<usize>)> {
     })
 }
 
-pub(super) fn is_primitive(name: &str) -> bool {
+pub fn is_primitive(name: &str) -> bool {
     arity(name).is_some()
 }
 
-/// Arity of the wrapper function used when a primitive is passed as a value.
+/// Arity of the wrapper function used when a fixed-arity primitive is passed
+/// as a value. (Variadic ones use library functions, see `VALUE_WRAPPERS`.)
 pub(super) fn value_arity(name: &str) -> Option<usize> {
-    match name {
-        "+" | "-" | "*" => Some(2),
-        "list" | "vector" => None,
-        _ => arity(name).map(|(min, _)| min),
+    match arity(name)? {
+        (min, Some(max)) if min == max => Some(min),
+        (min, Some(_)) => Some(min),
+        _ => None,
     }
 }
 
@@ -68,7 +70,9 @@ impl Compiler {
             ("-", 1) => {
                 self.compile(&args[0], env, si, false)?;
                 self.check_fixnum("x0", name);
-                emit!(self, "neg x0, x0");
+                let err = self.overflow_label(name);
+                emit!(self, "negs x0, x0");
+                emit!(self, "b.vs {err}");
                 return Ok(());
             }
             ("+" | "-" | "*", n) if n > 2 => {
@@ -86,15 +90,14 @@ impl Compiler {
                 };
                 return self.compile_primitive(name, &[args[0].clone(), default], env, si);
             }
+            ("exit", 0) => return self.compile_primitive(name, &[Expr::Int(0)], env, si),
             ("list", n) => {
                 self.args_to_slots(args, env, si)?;
-                self.list_from_slots(si, n);
-                return Ok(());
+                return self.list_from_slots(si, n, None);
             }
             ("vector", n) => {
                 self.args_to_slots(args, env, si)?;
-                self.vector_from_slots(si, n);
-                return Ok(());
+                return self.vector_from_slots(si, n);
             }
             _ => {}
         }
@@ -104,7 +107,7 @@ impl Compiler {
         } else {
             self.args_to_slots(args, env, si)?;
             for i in 0..args.len() {
-                emit!(self, "ldr x{i}, [sp, #{}]", (si + i) * 8);
+                self.load_slot(&format!("x{i}"), si + i);
             }
         }
         self.primitive_op(name, si);
@@ -131,6 +134,13 @@ impl Compiler {
         emit!(self, "orr x9, x0, x1");
         emit!(self, "tst x9, #3");
         emit!(self, "b.ne {err}");
+    }
+
+    fn overflow_label(&mut self, who: &str) -> String {
+        self.error_label(
+            &format!("{who}: integer overflow (integers are 62-bit)"),
+            "",
+        )
     }
 
     fn check_tag(&mut self, reg: &str, mask: i64, tag: i64, who: &str, what: &str) {
@@ -172,56 +182,72 @@ impl Compiler {
 
     // ───────── constructors ─────────
 
-    /// x0 = a list of the values in slots `base..base+n`.
-    pub(super) fn list_from_slots(&mut self, base: usize, n: usize) {
+    /// x0 = a list of the values in slots `base..base+n`, ending in the value
+    /// in slot `tail` (or `()`).
+    pub(super) fn list_from_slots(
+        &mut self,
+        base: usize,
+        n: usize,
+        tail: Option<usize>,
+    ) -> Result<()> {
         if n == 0 {
-            self.load_imm("x0", EMPTY);
-            return;
+            match tail {
+                Some(t) => self.load_slot("x0", t),
+                None => self.load_imm("x0", EMPTY),
+            }
+            return Ok(());
         }
         // one allocation for all n pairs, laid out consecutively
         self.alloc(16 * n);
         emit!(self, "mov x2, x0");
         for i in 0..n {
-            emit!(self, "ldr x1, [sp, #{}]", (base + i) * 8);
-            emit!(self, "str x1, [x2]");
+            self.load_slot("x1", base + i);
             if i + 1 < n {
-                emit!(self, "add x1, x2, #{}", 16 + PAIR_TAG);
+                emit!(self, "add x3, x2, #{}", 16 + PAIR_TAG);
             } else {
-                self.load_imm("x1", EMPTY);
+                match tail {
+                    Some(t) => self.load_slot("x3", t),
+                    None => self.load_imm("x3", EMPTY),
+                }
             }
-            emit!(self, "str x1, [x2, #8]");
-            emit!(self, "add x2, x2, #16");
+            emit!(self, "stp x1, x3, [x2], #16");
         }
         emit!(self, "add x0, x0, #{PAIR_TAG}");
+        Ok(())
     }
 
-    fn vector_from_slots(&mut self, base: usize, n: usize) {
+    pub(super) fn vector_from_slots(&mut self, base: usize, n: usize) -> Result<()> {
         self.alloc((8 + 8 * n).div_ceil(16) * 16);
         self.load_imm("x1", (n as i64) << FIXNUM_SHIFT);
-        emit!(self, "str x1, [x0]");
+        emit!(self, "mov x2, x0");
+        emit!(self, "str x1, [x2], #8");
         for i in 0..n {
-            emit!(self, "ldr x1, [sp, #{}]", (base + i) * 8);
-            emit!(self, "str x1, [x0, #{}]", 8 + 8 * i);
+            self.load_slot("x1", base + i);
+            emit!(self, "str x1, [x2], #8");
         }
         emit!(self, "add x0, x0, #{VECTOR_TAG}");
+        Ok(())
     }
 
-    /// Call a C runtime function with the value in x0.
-    fn call_runtime(&mut self, func: &str) {
+    /// Call a C runtime function with the arguments in x0 (and x1).
+    fn call_runtime(&mut self, func: &str, returns_void: bool) {
         emit!(self, "bl _{func}");
-        self.load_imm("x0", VOID);
+        if returns_void {
+            self.load_imm("x0", VOID);
+        }
     }
 
     /// Operands are in x0 (and x1, x2), and also in slots `si..` when there's
     /// more than one, so they can be reloaded after an allocation.
     fn primitive_op(&mut self, name: &str, si: usize) {
-        let slot = |k: usize| format!("[sp, #{}]", (si + k) * 8);
         match name {
-            // ── fixnums
+            // ── fixnums (all arithmetic is checked for overflow)
             "add1" | "sub1" => {
                 self.check_fixnum("x0", name);
-                let op = if name == "add1" { "add" } else { "sub" };
+                let err = self.overflow_label(name);
+                let op = if name == "add1" { "adds" } else { "subs" };
                 emit!(self, "{op} x0, x0, #{}", 1 << FIXNUM_SHIFT);
+                emit!(self, "b.vs {err}");
             }
             "zero?" => {
                 self.check_fixnum("x0", name);
@@ -230,26 +256,37 @@ impl Compiler {
             }
             "+" | "-" => {
                 self.check_fixnums(name);
-                let op = if name == "+" { "add" } else { "sub" };
+                let err = self.overflow_label(name);
+                let op = if name == "+" { "adds" } else { "subs" };
                 emit!(self, "{op} x0, x0, x1");
+                emit!(self, "b.vs {err}");
             }
             "*" => {
                 self.check_fixnums(name);
-                // (a<<2) * (b<<2) would be ab<<4, so untag one side first
-                emit!(self, "asr x0, x0, #{FIXNUM_SHIFT}");
-                emit!(self, "mul x0, x0, x1");
+                let err = self.overflow_label(name);
+                // (a<<2) * (b<<2) would be ab<<4, so untag one side first;
+                // it overflowed unless the high half is just the sign of the low half
+                emit!(self, "asr x2, x0, #{FIXNUM_SHIFT}");
+                emit!(self, "mul x0, x2, x1");
+                emit!(self, "smulh x3, x2, x1");
+                emit!(self, "cmp x3, x0, asr #63");
+                emit!(self, "b.ne {err}");
             }
             "quotient" | "remainder" | "modulo" => {
                 self.check_fixnums(name);
-                let err = self.error_label(&format!("{name}: division by zero"), "mov x1, #79");
+                let err = self.error_label(&format!("{name}: division by zero"), "");
                 emit!(self, "cbz x1, {err}");
                 emit!(self, "sdiv x2, x0, x1"); // (a<<2)/(b<<2) = a/b, untagged
                 if name == "quotient" {
+                    // only the most negative fixnum divided by -1 can overflow
+                    let err = self.overflow_label(name);
                     emit!(self, "lsl x0, x2, #{FIXNUM_SHIFT}");
+                    emit!(self, "cmp x2, x0, asr #{FIXNUM_SHIFT}");
+                    emit!(self, "b.ne {err}");
                 } else {
                     emit!(self, "msub x0, x2, x1, x0"); // a - (a/b)*b, still tagged
                     if name == "modulo" {
-                        // result takes the sign of the divisor
+                        // the result takes the sign of the divisor
                         let done = self.fresh("L");
                         emit!(self, "cbz x0, {done}");
                         emit!(self, "eor x3, x0, x1");
@@ -329,6 +366,10 @@ impl Compiler {
             }
             "integer->char" => {
                 self.check_fixnum("x0", name);
+                let err = self.error_label(&format!("{name}: not a character code:"), "mov x1, x0");
+                self.load_imm("x9", 0x10FFFF << FIXNUM_SHIFT);
+                emit!(self, "cmp x0, x9");
+                emit!(self, "b.hi {err}"); // unsigned: negative codes fail too
                 emit!(self, "lsl x0, x0, #{}", CHAR_SHIFT - FIXNUM_SHIFT);
                 emit!(self, "add x0, x0, #{CHAR_TAG}");
             }
@@ -336,8 +377,8 @@ impl Compiler {
             // ── pairs
             "cons" => {
                 self.alloc(16);
-                emit!(self, "ldr x1, {}", slot(0));
-                emit!(self, "ldr x2, {}", slot(1));
+                self.load_slot("x1", si);
+                self.load_slot("x2", si + 1);
                 emit!(self, "stp x1, x2, [x0]");
                 emit!(self, "add x0, x0, #{PAIR_TAG}");
             }
@@ -375,8 +416,8 @@ impl Compiler {
                 emit!(self, "add x10, x10, #23"); // + 8 for the length, rounded up to 16
                 emit!(self, "and x10, x10, #0xfffffffffffffff0");
                 emit!(self, "bl scm_alloc");
-                emit!(self, "ldr x1, {}", slot(0));
-                emit!(self, "ldr x2, {}", slot(1));
+                self.load_slot("x1", si);
+                self.load_slot("x2", si + 1);
                 emit!(self, "str x1, [x0]");
                 self.fill_loop("str x2, [x3], #8", "add x4, x3, x1, lsl #1");
                 emit!(self, "add x0, x0, #{VECTOR_TAG}");
@@ -405,8 +446,8 @@ impl Compiler {
                 emit!(self, "add x10, x10, #23");
                 emit!(self, "and x10, x10, #0xfffffffffffffff0");
                 emit!(self, "bl scm_alloc");
-                emit!(self, "ldr x1, {}", slot(0));
-                emit!(self, "ldr x2, {}", slot(1));
+                self.load_slot("x1", si);
+                self.load_slot("x2", si + 1);
                 emit!(self, "lsr x2, x2, #{CHAR_SHIFT}");
                 emit!(self, "str x1, [x0]");
                 self.fill_loop("strb w2, [x3], #1", "add x4, x3, x1, asr #2");
@@ -431,20 +472,32 @@ impl Compiler {
                 emit!(self, "sturb w2, [x3, #{}]", 8 - STRING_TAG);
                 self.load_imm("x0", VOID);
             }
+
+            // ── symbols
             "%symbol-chars" => {
                 // a symbol has the same layout as a string; just retag it
                 self.check_tag("x0", 7, SYMBOL_TAG, "symbol->string", "a symbol");
                 emit!(self, "add x0, x0, #{}", STRING_TAG - SYMBOL_TAG);
             }
+            "string->symbol" => {
+                // interned by the runtime (symbols live outside the GC heap)
+                self.check_tag("x0", 7, STRING_TAG, name, "a string");
+                self.call_runtime("scheme_string_to_symbol", false);
+            }
 
-            // ── I/O
-            "display" => self.call_runtime("scheme_display"),
-            "write" => self.call_runtime("scheme_write"),
+            // ── I/O and control
+            "display" => self.call_runtime("scheme_display", true),
+            "write" => self.call_runtime("scheme_write", true),
             "newline" => {
                 self.load_imm("x0", (('\n' as i64) << CHAR_SHIFT) | CHAR_TAG);
-                self.call_runtime("scheme_display");
+                self.call_runtime("scheme_display", true);
             }
             "error" => emit!(self, "bl _scheme_user_error"), // doesn't return
+            "exit" => {
+                self.check_fixnum("x0", name);
+                emit!(self, "asr x0, x0, #{FIXNUM_SHIFT}");
+                emit!(self, "bl _scheme_exit"); // doesn't return
+            }
 
             _ => unreachable!("unhandled primitive {name}"),
         }
