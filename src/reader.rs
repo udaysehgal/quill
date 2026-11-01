@@ -5,6 +5,7 @@ pub enum Expr {
     Int(i64),
     Bool(bool),
     Char(char),
+    Str(String),
     Symbol(String),
     List(Vec<Expr>),
 }
@@ -14,6 +15,7 @@ enum Token {
     LParen,
     RParen,
     Quote,
+    Str(String),
     Atom(String),
 }
 
@@ -41,6 +43,24 @@ fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                 chars.next();
                 tokens.push(Token::Quote);
             }
+            '"' => {
+                chars.next();
+                let mut s = String::new();
+                loop {
+                    match chars.next().ok_or("unterminated string")? {
+                        '"' => break,
+                        '\\' => s.push(match chars.next().ok_or("unterminated string")? {
+                            'n' => '\n',
+                            't' => '\t',
+                            '0' => '\0',
+                            c @ ('"' | '\\') => c,
+                            c => return Err(format!("unknown string escape \\{c}")),
+                        }),
+                        c => s.push(c),
+                    }
+                }
+                tokens.push(Token::Str(s));
+            }
             _ => {
                 let mut atom = String::new();
                 // `#\(` and `#\ ` are char literals, so the char after `#\` is always taken
@@ -52,7 +72,7 @@ fn tokenize(src: &str) -> Result<Vec<Token>, String> {
                     }
                 }
                 while let Some(&c) = chars.peek() {
-                    if c.is_whitespace() || "()[];'".contains(c) {
+                    if c.is_whitespace() || "()[];'\"".contains(c) {
                         break;
                     }
                     atom.push(c);
@@ -112,6 +132,7 @@ fn parse(tokens: &[Token], pos: &mut usize) -> Result<Expr, String> {
             let quoted = parse(tokens, pos)?;
             Ok(Expr::List(vec![Expr::Symbol("quote".into()), quoted]))
         }
+        Token::Str(s) => Ok(Expr::Str(s.clone())),
         Token::Atom(s) => parse_atom(s),
     }
 }
@@ -151,7 +172,10 @@ mod tests {
     fn reads_nested_lists() {
         assert_eq!(
             read("(add1 (add1 41))").unwrap(),
-            Expr::List(vec![sym("add1"), Expr::List(vec![sym("add1"), Expr::Int(41)])])
+            Expr::List(vec![
+                sym("add1"),
+                Expr::List(vec![sym("add1"), Expr::Int(41)])
+            ])
         );
     }
 
@@ -163,6 +187,20 @@ mod tests {
         assert_eq!(read("#\\(").unwrap(), Expr::Char('('));
         assert_eq!(read("#\\space").unwrap(), Expr::Char(' '));
         assert_eq!(read("-12").unwrap(), Expr::Int(-12));
+    }
+
+    #[test]
+    fn reads_strings() {
+        assert_eq!(read(r#""hi there""#).unwrap(), Expr::Str("hi there".into()));
+        assert_eq!(
+            read(r#""a\"b\\c\n""#).unwrap(),
+            Expr::Str("a\"b\\c\n".into())
+        );
+        assert_eq!(
+            read(r#""(not a list)""#).unwrap(),
+            Expr::Str("(not a list)".into())
+        );
+        assert!(read(r#""open"#).is_err());
     }
 
     #[test]
