@@ -1,12 +1,5 @@
-//! A Scheme-to-ARM64 compiler.
-//!
-//! Pipeline: source text --(reader)--> Expr --(expander)--> core forms
-//!           --(compiler)--> ARM64 assembly --(clang + runtime.c)--> executable
-
-mod compiler;
-mod expand;
-mod reader;
-mod syntax;
+//! The quill command: compile a Scheme file with the library, then assemble
+//! and link the result with clang and the prebuilt runtime.
 
 use std::process::Command;
 use std::{env, fs};
@@ -19,6 +12,7 @@ fn main() {
         eprintln!("usage: {NAME} <file.scm> [-o output] [-S]");
         eprintln!("  -o output   name of the executable (default a.out)");
         eprintln!("  -S          print the generated assembly instead");
+        eprintln!("  -E          print the program after macro expansion instead");
         std::process::exit(1);
     }
     let input = &args[1];
@@ -31,8 +25,11 @@ fn main() {
     let asm_only = args.iter().any(|a| a == "-S");
 
     let src = fs::read_to_string(input).unwrap_or_else(|e| fail(&format!("{input}: {e}")));
-    let forms = reader::read_all(&src).unwrap_or_else(|e| fail(&locate(input, &e)));
-    let asm = compiler::compile_program(&forms, input).unwrap_or_else(|e| fail(&locate(input, &e)));
+    if args.iter().any(|a| a == "-E") {
+        print!("{}", quill::expand_source(&src, input).unwrap_or_else(|e| fail(&e)));
+        return;
+    }
+    let asm = quill::compile_source(&src, input).unwrap_or_else(|e| fail(&e));
 
     if asm_only {
         print!("{asm}");
@@ -61,17 +58,6 @@ fn main() {
 
 /// runtime/runtime.c, compiled by build.rs.
 const RUNTIME_OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/runtime.o"));
-
-/// `line 3: msg` -> `file.scm:3: msg`
-fn locate(file: &str, err: &str) -> String {
-    if let Some(rest) = err.strip_prefix("line ")
-        && let Some((n, msg)) = rest.split_once(": ")
-        && n.chars().all(|c| c.is_ascii_digit())
-    {
-        return format!("{file}:{n}: {msg}");
-    }
-    format!("{file}: {err}")
-}
 
 fn fail(msg: &str) -> ! {
     eprintln!("{NAME}: {msg}");

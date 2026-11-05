@@ -502,6 +502,40 @@ check_error '(define (f x x) x) 1' 'duplicate parameter'
 check_error '(foo 1)' 'unbound variable: foo'
 check_error '(add1 1 2)' 'expects 1 argument'
 
+# ── continuations and dynamic-wind
+check '(+ 1 (call/cc (lambda (k) (+ 10 (k 5)))))' '6'
+check '(call/cc (lambda (k) 42))' '42'
+check '(call-with-current-continuation (lambda (k) (k 7)))' '7'
+check '(define (find p l) (call/cc (lambda (ret) (for-each (lambda (x) (when (p x) (ret x))) l) #f))) (list (find even? (list 1 3 4 5)) (find even? (list 1 3)))' '(4 #f)'
+check '(define k #f) (define n 0) (display (call/cc (lambda (c) (set! k c) 0))) (set! n (add1 n)) (when (< n 4) (k n))' '0123'
+check '(define (make-gen l) (define return #f) (define (resume) (for-each (lambda (x) (call/cc (lambda (next) (set! resume (lambda () (next #f))) (return x)))) l) (return (quote done))) (lambda () (call/cc (lambda (r) (set! return r) (resume))))) (define g (make-gen (list 1 2 3))) (list (g) (g) (g) (g) (g))' '(1 2 3 done done)'
+check '(define (loop i) (if (= i 1000000) (quote ok) (call/cc (lambda (k) (loop (add1 i)))))) (loop 0)' 'ok'
+check '(define (deep n) (if (= n 0) (call/cc (lambda (k) k)) (let ([r (deep (- n 1))]) r))) (define k (deep 100000)) (if (procedure? k) (k (quote back)) k)' 'back'
+check '(call/cc procedure?)' '#t'
+check '((call/cc (lambda (k) k)) (lambda (x) (quote id)))' 'id'
+check '(call/cc (lambda (k) (k)))' ''
+check '(define f call/cc) (f (lambda (k) (k (quote v))))' 'v'
+check '(let ([v (make-vector 3 0)]) (+ 1 (call/cc (lambda (k) (vector-set! v 0 k) 1))) (vector-length v))' '3'
+check '(define fails (list)) (define (fail) (let ([k (car fails)]) (set! fails (cdr fails)) (k #f))) (define (amb l) (call/cc (lambda (k) (for-each (lambda (c) (call/cc (lambda (next) (set! fails (cons next fails)) (k c)))) l) (fail)))) (let* ([a (amb (iota 15))] [b (amb (iota 15))] [c (amb (iota 15))]) (unless (and (< 0 a) (< a b) (= (+ (* a a) (* b b)) (* c c))) (fail)) (list a b c))' '(3 4 5)'
+check '(define t (list)) (define (note x) (set! t (cons x t))) (dynamic-wind (lambda () (note 1)) (lambda () (note 2)) (lambda () (note 3))) (reverse t)' '(1 2 3)'
+check '(dynamic-wind (lambda () 0) (lambda () (quote result)) (lambda () 0))' 'result'
+check '(define t (list)) (define (note x) (set! t (cons x t))) (call/cc (lambda (k) (dynamic-wind (lambda () (note (quote in))) (lambda () (k 1) (note (quote never))) (lambda () (note (quote out)))))) (reverse t)' '(in out)'
+check '(define t (list)) (define (note x) (set! t (cons x t))) (call/cc (lambda (out) (dynamic-wind (lambda () (note 1)) (lambda () (dynamic-wind (lambda () (note 2)) (lambda () (out 0)) (lambda () (note 3)))) (lambda () (note 4))))) (reverse t)' '(1 2 3 4)'
+check '(define t (list)) (define (note x) (set! t (cons x t))) (define k #f) (define n 0) (dynamic-wind (lambda () (note (quote before))) (lambda () (call/cc (lambda (c) (set! k c))) (note (quote body))) (lambda () (note (quote after)))) (set! n (add1 n)) (when (< n 2) (k #f)) (reverse t)' '(before body after before body after)'
+check '(define t (list)) (define (note x) (set! t (cons x t))) (define k #f) (define n 0) (dynamic-wind (lambda () (note (quote a))) (lambda () (call/cc (lambda (c) (set! k c)))) (lambda () (note (quote b)))) (dynamic-wind (lambda () (note (quote c))) (lambda () (set! n (add1 n)) (when (< n 2) (k 0))) (lambda () (note (quote d)))) (reverse t)' '(a b c d a b c d)'
+check_runtime_error '(call/cc 5)' 'call/cc: expected a procedure, got 5'
+check_runtime_error '(call/cc (lambda (k) (k 1 2)))' 'continuation: expected 0 or 1 argument(s), got 2'
+check_error '(call/cc)' 'expects 1 argument'
+check '(define (call/cc x) (* x 2)) (call/cc 21)' '42'
+
+# ── -E prints the program after macro expansion
+printf '%s' '(define-syntax my-if (syntax-rules () [(_ c a b) (cond [c a] [else b])])) (define (f x) (my-if x 1 2)) (f #t)' > "$tmp/t.scm"
+if [ "$(./target/debug/quill "$tmp/t.scm" -E)" = "$(printf '(define (f x) (if x (begin 1) (begin 2)))\n\n(f #t)')" ]; then
+  pass=$((pass+1))
+else
+  fail=$((fail+1)); echo "FAIL: -E output"; ./target/debug/quill "$tmp/t.scm" -E
+fi
+
 # ── the example programs compile and run
 for ex in examples/*.scm; do
   if ./target/debug/quill "$ex" -o "$tmp/ex" 2>"$tmp/err" && "$tmp/ex" >/dev/null 2>>"$tmp/err"; then

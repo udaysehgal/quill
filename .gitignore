@@ -1,3 +1,5 @@
 /target
 *.s
 a.out
+playground/target/
+playground/web/quill.wasm

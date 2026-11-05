@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quill playground: Scheme to ARM64</title>
+<meta name="description" content="Type Scheme and watch quill compile it to ARM64 assembly, in your browser.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Hanken+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --desk: #C5C9C0;
+    --paper: #F7F8F3;
+    --bar: #DDEBD4;
+    --ink: #1E2722;
+    --ink-soft: #5B6660;
+    --ribbon: #2A4A94;
+    --error: #A8261C;
+    --hole: #C5C9C0;
+    --code: "Courier Prime", "Courier New", monospace;
+    --ui: "Hanken Grotesk", system-ui, sans-serif;
+    --line: 1.5rem;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--desk); color: var(--ink); }
+  body {
+    margin: 0;
+    font: 400 1rem/1.5 var(--ui);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  a { color: var(--ribbon); text-underline-offset: 0.2em; }
+  :focus-visible { outline: 2px solid var(--ribbon); outline-offset: 2px; }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 1.25rem;
+    flex-wrap: wrap;
+    padding: 1.5rem clamp(1rem, 3vw, 2.5rem) 1.25rem;
+  }
+  h1 {
+    margin: 0;
+    font: 700 2.25rem/1 var(--code);
+    letter-spacing: -0.02em;
+  }
+  .tagline { margin: 0; color: var(--ink-soft); max-width: 60ch; }
+  header a { margin-left: auto; font-weight: 500; }
+
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+    gap: clamp(1rem, 2vw, 1.75rem);
+    padding: 0 clamp(1rem, 3vw, 2.5rem);
+    min-height: 0;
+  }
+
+  /* the source: a plain sheet */
+  .sheet {
+    background: var(--paper);
+    display: flex;
+    flex-direction: column;
+    min-height: 32rem;
+    box-shadow: 0 1px 0 rgba(30, 39, 34, 0.25), 0 12px 24px -16px rgba(30, 39, 34, 0.5);
+  }
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid #D5D9CF;
+    font-size: 0.9rem;
+    min-height: 3rem;
+  }
+  .bar label { color: var(--ink-soft); }
+  select, button {
+    font: 500 0.9rem var(--ui);
+    color: var(--ink);
+    background: var(--paper);
+    border: 1px solid #B7BDB2;
+    border-radius: 3px;
+    padding: 0.3rem 0.6rem;
+  }
+  textarea {
+    flex: 1;
+    width: 100%;
+    resize: none;
+    border: 0;
+    padding: 1rem 1.25rem;
+    background: transparent;
+    color: var(--ink);
+    font: 400 0.95rem/var(--line) var(--code);
+    tab-size: 2;
+    outline: none;
+  }
+  textarea:focus-visible { box-shadow: inset 0 0 0 2px var(--ribbon); }
+
+  /* the listing: green-bar continuous-feed paper with tractor holes */
+  .listing {
+    --margin: 2.25rem;
+    position: relative;
+    background-color: var(--paper);
+    background-image:
+      radial-gradient(circle at center, var(--hole) 0.36rem, transparent 0.4rem),
+      radial-gradient(circle at center, var(--hole) 0.36rem, transparent 0.4rem);
+    background-size: var(--margin) 1.5rem, var(--margin) 1.5rem;
+    background-position: 0 0.5rem, 100% 0.5rem;
+    background-repeat: repeat-y, repeat-y;
+    padding: 0 var(--margin);
+    display: flex;
+    flex-direction: column;
+    min-height: 32rem;
+    min-width: 0;
+    box-shadow: 0 1px 0 rgba(30, 39, 34, 0.25), 0 12px 24px -16px rgba(30, 39, 34, 0.5);
+  }
+  .listing::before, .listing::after {   /* the perforation along each margin */
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0;
+    border-left: 1px dashed #C9CEC3;
+  }
+  .listing::before { left: var(--margin); }
+  .listing::after { right: var(--margin); }
+  .listing .bar { border-bottom-color: #CBD8C3; padding-inline: 0.75rem; }
+  .tabs { display: flex; gap: 0.25rem; }
+  .tabs button { border-color: transparent; background: transparent; white-space: nowrap; }
+  .tabs button[aria-selected="true"] { border-color: var(--ink); font-weight: 700; }
+  .count { margin-left: auto; white-space: nowrap; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .out {
+    flex: 1;
+    margin: 0;
+    overflow: auto;
+    max-height: calc(100vh - 13rem);
+    min-height: 28rem;
+    padding: 0 0.75rem;
+    font: 400 0.9rem/var(--line) var(--code);
+    white-space: pre;
+    /* three lines white, three lines green, like the real paper */
+    background-image: repeating-linear-gradient(
+      to bottom,
+      transparent 0, transparent calc(var(--line) * 3),
+      var(--bar) calc(var(--line) * 3), var(--bar) calc(var(--line) * 6));
+    background-attachment: local;
+  }
+  .out .op { color: var(--ribbon); }
+  .out .lbl { font-weight: 700; }
+  .out .cm { color: var(--ink-soft); font-style: italic; }
+  .out.failed { color: var(--error); white-space: pre-wrap; }
+
+  footer {
+    padding: 1.5rem clamp(1rem, 3vw, 2.5rem) 2rem;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+    gap: clamp(1rem, 2vw, 1.75rem);
+    font-size: 0.95rem;
+  }
+  footer p { margin: 0 0 0.5rem; max-width: 62ch; }
+  footer pre {
+    margin: 0;
+    padding: 0.75rem 1rem;
+    background: var(--paper);
+    font: 400 0.85rem/1.6 var(--code);
+    overflow-x: auto;
+  }
+
+  @media (max-width: 860px) {
+    main, footer { grid-template-columns: 1fr; }
+    .sheet, .listing { min-height: 22rem; }
+    .out { max-height: 70vh; min-height: 20rem; }
+    .listing { --margin: 1.5rem; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>quill</h1>
+  <p class="tagline">A Scheme compiler that emits ARM64 machine code, running in your browser as WebAssembly. Edit the program and the listing updates as you type.</p>
+  <a href="https://github.com/udaysehgal/quill">Source on GitHub</a>
+</header>
+
+<main>
+  <section class="sheet" aria-label="Scheme source">
+    <div class="bar">
+      <label for="example">Example</label>
+      <select id="example"></select>
+    </div>
+    <textarea id="src" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Scheme program"></textarea>
+  </section>
+
+  <section class="listing" aria-label="Compiler output">
+    <div class="bar">
+      <div class="tabs" role="tablist">
+        <button role="tab" id="tab-asm" aria-selected="true" data-mode="0">ARM64 assembly</button>
+        <button role="tab" id="tab-exp" aria-selected="false" data-mode="1">After macro expansion</button>
+      </div>
+      <span class="count" id="count" aria-live="polite"></span>
+    </div>
+    <pre class="out" id="out" role="tabpanel" tabindex="0">Loading the compiler…</pre>
+  </section>
+</main>
+
+<footer>
+  <div>
+    <p>The browser can't run the output, because quill writes native code for Apple Silicon. Building it on a Mac takes three commands, and needs Rust and the Xcode command line tools.</p>
+  </div>
+  <pre>git clone https://github.com/udaysehgal/quill && cd quill
+cargo build --release
+./target/release/quill examples/queens.scm -o queens && ./queens</pre>
+</footer>
+
+<script>
+const EXAMPLES = {
+  "Generators with call/cc": `;; A generator: each call resumes the loop where it left off.
+;; call/cc copies the stack; calling a continuation puts it back.
+(define (make-generator items)
+  (define return #f)
+  (define (resume)
+    (for-each (lambda (x)
+                (call/cc (lambda (next)
+                           (set! resume (lambda () (next #f)))
+                           (return x))))
+              items)
+    (return 'done))
+  (lambda ()
+    (call/cc (lambda (r) (set! return r) (resume)))))
+
+(define next-color (make-generator '(red green blue)))
+(list (next-color) (next-color) (next-color) (next-color))
+; => (red green blue done)`,
+  "Backtracking with amb": `;; amb picks a value; (fail) jumps back to the last choice
+;; and tries the next one.
+(define choices '())
+(define (fail)
+  (let ([k (car choices)])
+    (set! choices (cdr choices))
+    (k #f)))
+(define (amb options)
+  (call/cc
+   (lambda (return)
+     (for-each (lambda (option)
+                 (call/cc (lambda (retry)
+                            (set! choices (cons retry choices))
+                            (return option))))
+               options)
+     (fail))))
+
+(let* ([a (amb (iota 20))] [b (amb (iota 20))] [c (amb (iota 20))])
+  (unless (and (< 0 a) (< a b) (= (+ (* a a) (* b b)) (* c c)))
+    (fail))
+  (list a b c))
+; => (3 4 5)`,
+  "Tail calls": `;; A call in tail position reuses the frame: look for "b scm_fn"
+;; (a jump) instead of "bl" (a call) in the assembly.
+(define (count-down n)
+  (if (= n 0)
+      'liftoff
+      (count-down (sub1 n))))
+
+(count-down 100000000)`,
+  "Closures and set!": `;; n is assigned, so it lives in a heap box that the
+;; closure shares. Find the allocation for the box in the listing.
+(define (make-counter)
+  (let ([n 0])
+    (lambda ()
+      (set! n (add1 n))
+      n)))
+
+(define c (make-counter))
+(c) (c)
+(c)
+; => 3`,
+  "Macros": `;; syntax-rules macros expand before code generation.
+;; Switch to "After macro expansion" to see the core forms.
+(define-syntax while
+  (syntax-rules ()
+    [(_ test body ...) (let loop () (when test body ... (loop)))]))
+
+(define-syntax swap!
+  (syntax-rules ()
+    [(_ a b) (let ([tmp a]) (set! a b) (set! b tmp))]))
+
+(let ([i 0] [tmp 'x] [other 'y])
+  (while (< i 3)
+    (swap! tmp other)
+    (set! i (add1 i)))
+  (list tmp other))
+; => (y x)`,
+  "N-queens": `;; Count the solutions to the N-queens puzzle.
+(define (safe? col placed)
+  (let loop ([placed placed] [distance 1])
+    (or (null? placed)
+        (let ([c (car placed)])
+          (and (not (= c col))
+               (not (= (abs (- c col)) distance))
+               (loop (cdr placed) (add1 distance)))))))
+
+(define (queens n)
+  (let place ([row 0] [placed '()])
+    (if (= row n)
+        1
+        (fold-left + 0
+                   (map (lambda (col)
+                          (if (safe? col placed)
+                              (place (add1 row) (cons col placed))
+                              0))
+                        (iota n))))))
+
+(queens 8)
+; => 92`,
+};
+
+const src = document.getElementById("src");
+const out = document.getElementById("out");
+const count = document.getElementById("count");
+const select = document.getElementById("example");
+const tabs = [...document.querySelectorAll(".tabs button")];
+let mode = 0, quill = null;
+
+for (const name of Object.keys(EXAMPLES)) select.add(new Option(name, name));
+src.value = EXAMPLES[select.value];
+
+async function load() {
+  const { instance } = await WebAssembly.instantiateStreaming(fetch("quill.wasm"));
+  quill = instance.exports;
+}
+
+function compile(text, m) {
+  const bytes = new TextEncoder().encode(text);
+  const ptr = quill.alloc(bytes.length);
+  new Uint8Array(quill.memory.buffer, ptr, bytes.length).set(bytes);
+  const ok = quill.compile(ptr, bytes.length, m);
+  const result = new Uint8Array(quill.memory.buffer, quill.output_ptr(), quill.output_len());
+  return { ok: ok === 1, text: new TextDecoder().decode(result) };
+}
+
+const escape = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+function highlightAsm(text) {
+  return text.split("\n").map(line => {
+    const m = line.match(/^(\s*)([^\/]*?)(\s*\/\/.*)?$/);
+    if (!m) return escape(line);
+    let [, indent, code, comment = ""] = m;
+    if (/^[\w.$]+:/.test(code)) code = `<span class="lbl">${escape(code)}</span>`;
+    else code = escape(code).replace(/^(\.?[a-z][\w.]*)/, '<span class="op">$1</span>');
+    return indent + code + (comment && `<span class="cm">${escape(comment)}</span>`);
+  }).join("\n");
+}
+
+function render() {
+  if (!quill) return;
+  let r;
+  try {
+    r = compile(src.value, mode);
+  } catch (e) {
+    // a panic traps the module; start a fresh one
+    r = { ok: false, text: "internal compiler error (please report it on GitHub)" };
+    quill = null;
+    load().catch(() => {});
+  }
+  out.classList.toggle("failed", !r.ok);
+  if (!r.ok) {
+    out.textContent = r.text;
+    count.textContent = "error";
+    return;
+  }
+  out.innerHTML = mode === 0 ? highlightAsm(r.text) : escape(r.text);
+  if (mode === 0) {
+    const instrs = r.text.split("\n").filter(l => /^    [a-z]/.test(l)).length;
+    count.textContent = `${instrs.toLocaleString()} instructions`;
+    count.title = "Includes the library functions the program uses and the runtime glue";
+  } else {
+    count.textContent = "core forms";
+  }
+}
+
+let timer;
+src.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(render, 150); });
+src.addEventListener("keydown", e => {
+  if (e.key === "Tab" && !e.shiftKey) {
+    e.preventDefault();
+    src.setRangeText("  ", src.selectionStart, src.selectionEnd, "end");
+  }
+});
+select.addEventListener("change", () => { src.value = EXAMPLES[select.value]; render(); });
+for (const tab of tabs) {
+  tab.addEventListener("click", () => {
+    mode = Number(tab.dataset.mode);
+    tabs.forEach(t => t.setAttribute("aria-selected", String(t === tab)));
+    render();
+  });
+}
+
+load().then(render).catch(err => {
+  out.classList.add("failed");
+  out.textContent = "Couldn't load the compiler: " + err.message;
+});
+</script>
+</body>
+</html>

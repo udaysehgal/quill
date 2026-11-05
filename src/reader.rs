@@ -27,6 +27,96 @@ impl PartialEq for Line {
     }
 }
 
+impl std::fmt::Display for Expr {
+    /// Scheme syntax on one line. Fresh names made by the expander (`tmp 3`)
+    /// print as `tmp.3`.
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Expr::Int(n) => write!(f, "{n}"),
+            Expr::Bool(b) => write!(f, "{}", if *b { "#t" } else { "#f" }),
+            Expr::Char(c) => match c {
+                ' ' => write!(f, "#\\space"),
+                '\n' => write!(f, "#\\newline"),
+                '\t' => write!(f, "#\\tab"),
+                '\0' => write!(f, "#\\nul"),
+                c => write!(f, "#\\{c}"),
+            },
+            Expr::Str(s) => write!(f, "{s:?}"),
+            Expr::Symbol(s) => write!(f, "{}", s.replace(' ', ".")),
+            Expr::List(items, _) => {
+                if let [Expr::Symbol(q), datum] = items.as_slice()
+                    && q == "quote"
+                {
+                    return write!(f, "'{datum}");
+                }
+                write!(f, "(")?;
+                for (i, item) in items.iter().enumerate() {
+                    write!(f, "{}{item}", if i > 0 { " " } else { "" })?;
+                }
+                write!(f, ")")
+            }
+            Expr::Vector(items) => {
+                write!(f, "#(")?;
+                for (i, item) in items.iter().enumerate() {
+                    write!(f, "{}{item}", if i > 0 { " " } else { "" })?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
+/// Multi-line layout: a list that doesn't fit in `width` columns breaks
+/// after its first argument. The remaining arguments go two columns in for
+/// binding forms, and line up under the first argument otherwise.
+pub fn pretty(e: &Expr, width: usize) -> String {
+    let mut out = String::new();
+    layout(e, 0, width, &mut out);
+    out
+}
+
+fn layout(e: &Expr, col: usize, width: usize, out: &mut String) {
+    let flat = e.to_string();
+    let Expr::List(items, _) = e else {
+        out.push_str(&flat);
+        return;
+    };
+    if col + flat.len() <= width || flat.starts_with('\'') {
+        out.push_str(&flat);
+        return;
+    }
+    if items.len() < 2 || matches!(items[0], Expr::List(..)) {
+        // operator isn't a name, e.g. ((lambda ...) arg): one item per line
+        out.push('(');
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+                out.push_str(&" ".repeat(col + 1));
+            }
+            layout(item, col + 1, width, out);
+        }
+        out.push(')');
+        return;
+    }
+    let head = items[0].to_string();
+    let body_style = matches!(
+        head.as_str(),
+        "lambda" | "let" | "letrec" | "letrec*" | "define" | "set!" | "when" | "unless"
+    );
+    out.push('(');
+    out.push_str(&head);
+    out.push(' ');
+    let first_col = col + head.len() + 2;
+    layout(&items[1], first_col, width, out);
+    let indent = if body_style { col + 2 } else { first_col };
+    for item in &items[2..] {
+        out.push('\n');
+        out.push_str(&" ".repeat(indent));
+        layout(item, indent, width, out);
+    }
+    out.push(')');
+}
+
 #[derive(Debug, PartialEq)]
 enum Token {
     LParen,
@@ -329,6 +419,18 @@ mod tests {
         assert!(read("(1 2").is_err());
         assert!(read(")").is_err());
         assert!(read("1 2").is_err());
+    }
+
+    #[test]
+    fn prints_back() {
+        for src in ["(a \"s\\n\" #\\space 'x #(1 #t))", "(f)", "-5"] {
+            assert_eq!(read(src).unwrap().to_string(), src);
+        }
+        let e = read("(define (f x) (let ([y (g x x x x)]) (h y y y y y)))").unwrap();
+        assert_eq!(
+            pretty(&e, 30),
+            "(define (f x)\n  (let ((y (g x x x x)))\n    (h y y y y y)))"
+        );
     }
 
     #[test]

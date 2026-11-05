@@ -249,3 +249,49 @@
 (define (%spread args)   ; (a b (c d)) -> (a b c d)
   (if (null? (cdr args)) (car args) (cons (car args) (%spread (cdr args)))))
 (define (%apply f . args) (apply f (%spread args)))
+
+;; ── continuations
+;; %call/cc (assembly, in compiler.rs) captures the raw stack. %winders is the
+;; list of (before . after) thunks of the dynamic-winds we are inside, innermost
+;; first. Jumping to a continuation runs the afters of the extents we leave and
+;; the befores of the ones we re-enter, outermost first.
+(define %winders '())
+
+(define (dynamic-wind before thunk after)
+  (before)
+  (set! %winders (cons (cons before after) %winders))
+  (let ([result (thunk)])
+    (set! %winders (cdr %winders))
+    (after)
+    result))
+
+(define (%common-tail x y)
+  (let ([lx (length x)] [ly (length y)])
+    (let loop ([x (if (> lx ly) (list-tail x (- lx ly)) x)]
+               [y (if (> ly lx) (list-tail y (- ly lx)) y)])
+      (if (eq? x y) x (loop (cdr x) (cdr y))))))
+
+(define (%travel-to to)
+  (let ([common (%common-tail %winders to)])
+    (let unwind ()
+      (unless (eq? %winders common)
+        (let ([after (cdr (car %winders))])
+          (set! %winders (cdr %winders))
+          (after))
+        (unwind)))
+    (let rewind ([l to])
+      (unless (eq? l common)
+        (rewind (cdr l))
+        ((car (car l)))
+        (set! %winders l)))))
+
+(define (call-with-current-continuation f)
+  (unless (procedure? f) (error "call/cc: expected a procedure, got" f))
+  (%call/cc
+   (lambda (k)
+     (let ([winders %winders])
+       (f (lambda args
+            (unless (eq? %winders winders) (%travel-to winders))
+            (apply k args)))))))
+
+(define (call/cc f) (call-with-current-continuation f))

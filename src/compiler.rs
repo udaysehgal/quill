@@ -1088,6 +1088,60 @@ impl Compiler {
 /// Variadic primitives and `apply` used as values are these library functions.
 const VALUE_WRAPPERS: &[&str] = &["+", "-", "*", "list", "vector", "apply"];
 
+/// A program after macro expansion: every definition and expression is in
+/// core forms, and the prelude functions it uses are included.
+pub struct Program {
+    /// (name, definition, source line, comes from the prelude)
+    pub defs: Vec<(String, Def, u32, bool)>,
+    /// the top-level expressions, in order (`(define x e)` became `(set! x e)`)
+    pub main: Vec<Expr>,
+}
+
+impl Program {
+    /// The expanded program as Scheme source (for `-E` and the playground),
+    /// leaving out the prelude.
+    pub fn to_source(&self, width: usize) -> String {
+        let mut out = String::new();
+        for (name, def, _, from_prelude) in &self.defs {
+            if *from_prelude {
+                continue;
+            }
+            let form = match def {
+                Def::Function { params, body } => {
+                    let mut sig = vec![sym(name)];
+                    match params.to_expr() {
+                        Expr::List(items, _) => sig.extend(items),
+                        rest => sig.extend([sym("."), rest]),
+                    }
+                    let mut items = vec![sym("define"), list(sig)];
+                    items.extend(body.iter().cloned());
+                    list(items)
+                }
+                Def::Value(_) => list(vec![sym("define"), sym(name), Expr::Bool(false)]),
+            };
+            out.push_str(&reader::pretty(&form, width));
+            out.push_str("\n\n");
+        }
+        let is_prelude = |n: &str| self.defs.iter().any(|(d, .., p)| *p && d == n);
+        for e in &self.main {
+            match e {
+                Expr::List(items, _) if items.first() == Some(&sym("%void")) => continue,
+                // initializing a library variable
+                Expr::List(items, _)
+                    if items.first() == Some(&sym("set!"))
+                        && matches!(&items[1], Expr::Symbol(n) if is_prelude(n)) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            out.push_str(&reader::pretty(e, width));
+            out.push('\n');
+        }
+        out
+    }
+}
+
 /// Compile a whole program: top-level definitions and expressions,
 /// evaluated in order; the value of the last expression is printed.
 /// `file` is used in error messages.
@@ -1095,6 +1149,11 @@ const VALUE_WRAPPERS: &[&str] = &["+", "-", "*", "list", "vector", "apply"];
 /// Produces an assembly file defining
 /// `value scheme_entry(void *heap, void *heap_end, void *stack_top)`.
 pub fn compile_program(forms: &[Expr], file: &str) -> Result<String> {
+    generate(&expand_program(forms)?, file)
+}
+
+/// Expand macros and derived syntax, and pull in the prelude functions used.
+pub fn expand_program(forms: &[Expr]) -> Result<Program> {
     let mut ex = Expander::default();
     let prelude_forms = reader::read_all(PRELUDE).expect("prelude parses");
 
@@ -1202,8 +1261,11 @@ pub fn compile_program(forms: &[Expr], file: &str) -> Result<String> {
                 && !defs.iter().any(|(n, ..)| n == name)
             {
                 included.insert(name.clone());
-                if let Def::Function { body, .. } = def {
-                    body.iter().for_each(|e| all_symbols(e, &mut used));
+                match def {
+                    Def::Function { body, .. } => {
+                        body.iter().for_each(|e| all_symbols(e, &mut used))
+                    }
+                    Def::Value(e) => all_symbols(e, &mut used),
                 }
             }
         }
@@ -1211,20 +1273,39 @@ pub fn compile_program(forms: &[Expr], file: &str) -> Result<String> {
             break;
         }
     }
-    defs.extend(
-        prelude
-            .into_iter()
-            .filter(|(n, ..)| included.contains(n))
-            .map(|(n, d, l)| (n, d, l, true)),
-    );
+    let prelude: Vec<_> = prelude
+        .into_iter()
+        .filter(|(n, ..)| included.contains(n))
+        .collect();
+    // prelude variables are initialized before the program runs
+    let inits: Vec<Expr> = prelude
+        .iter()
+        .filter_map(|(n, d, _)| match d {
+            Def::Value(e) => Some(list(vec![sym("set!"), sym(n), e.clone()])),
+            Def::Function { .. } => None,
+        })
+        .collect();
+    main_body.splice(0..0, inits);
+    defs.extend(prelude.into_iter().map(|(n, d, l)| (n, d, l, true)));
+    Ok(Program {
+        defs,
+        main: main_body,
+    })
+}
 
+/// Generate the assembly for an expanded program.
+pub fn generate(program: &Program, file: &str) -> Result<String> {
+    let Program {
+        defs,
+        main: main_body,
+    } = program;
     // ── register globals so every function can see every other
     let mut c = Compiler {
         file: file.to_string(),
         ..Default::default()
     };
     let mut labels = Vec::new();
-    for (name, def, ..) in &defs {
+    for (name, def, ..) in defs {
         let global = match def {
             Def::Function { params, .. } => {
                 let label = c.fresh("scm_fn");
@@ -1247,19 +1328,46 @@ pub fn compile_program(forms: &[Expr], file: &str) -> Result<String> {
         c.globals.insert(name.clone(), global);
     }
 
+    // `%call/cc` is hand-written assembly (see RUNTIME_GLUE)
+    if !c.globals.contains_key("%call/cc") {
+        let closure = c.static_closure("scm_callcc");
+        c.globals.insert(
+            "%call/cc".into(),
+            Global::Func {
+                label: "scm_callcc".into(),
+                closure,
+                arity: 1,
+                rest: false,
+            },
+        );
+    }
+
     // ── code
     let no_params = Params {
         fixed: vec![],
         rest: None,
     };
-    c.compile_function("scm_main", "program", &no_params, &[], &main_body, false)?;
-    for ((name, def, line, from_prelude), label) in defs.iter().zip(&labels) {
+    // the listing reads in order: the program's functions, its top-level
+    // code, then the library functions it uses
+    c.text.push_str("\n// ───── the program\n");
+    let functions = |prelude: bool| {
+        defs.iter()
+            .zip(&labels)
+            .filter(move |((.., from_prelude), _)| *from_prelude == prelude)
+    };
+    for ((name, def, line, _), label) in functions(false) {
         if let Def::Function { params, body } = def {
-            c.file = if *from_prelude {
-                "prelude".into()
-            } else {
-                file.to_string()
-            };
+            c.line = *line;
+            c.compile_function(label, name, params, &[], body, true)
+                .map_err(|e| at_line(*line, e))?;
+        }
+    }
+    c.line = 0;
+    c.compile_function("scm_main", "program", &no_params, &[], main_body, false)?;
+    c.text.push_str("\n// ───── library functions it uses (src/prelude.scm)\n");
+    c.file = "prelude".into();
+    for ((name, def, line, _), label) in functions(true) {
+        if let Def::Function { params, body } = def {
             c.line = *line;
             c.compile_function(label, name, params, &[], body, true)
                 .map_err(|e| at_line(*line, e))?;
@@ -1275,8 +1383,10 @@ fn head_is_define_syntax(e: &Expr) -> bool {
 
 fn assemble(c: Compiler) -> String {
     let mut out = String::new();
-    out.push_str(RUNTIME_GLUE);
+    out.push_str("    .text\n");
     out.push_str(&c.text);
+    out.push_str("\n// ───── runtime: entry point, allocator, continuations\n");
+    out.push_str(RUNTIME_GLUE);
     out.push_str("\n// ───── runtime errors\n");
     for (i, e) in c.errors.iter().enumerate() {
         writeln!(out, "{}:", e.label).unwrap();
@@ -1376,4 +1486,117 @@ scm_alloc_slow:
     ldr x10, [sp], #16
     ldp x29, x30, [sp], #16
     b scm_alloc
+
+// ───── first-class continuations
+//
+// (%call/cc f): capture the continuation by copying the whole live Scheme
+// stack, from our caller's sp up to scm_stack_base, into a vector. That is
+// GC-safe as an ordinary vector: every word is either a tagged value (a
+// slot) or a saved x29/x30, and those are 16- and 4-byte aligned, so they
+// look like fixnums. The continuation is a closure
+//   [scm_cont_entry, 4, stack-copy, caller sp, caller x29, return address]
+// and f is tail-called with it, so f's normal return also goes to our caller.
+    .p2align 2
+scm_callcc:
+    cmp x9, #1
+    b.ne Lcallcc_arity
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    sub sp, sp, #16
+    stp x0, xzr, [sp]             // slot 0 = f, slot 1 = the stack copy
+    adrp x11, _scm_stack_base@PAGE
+    ldr x11, [x11, _scm_stack_base@PAGEOFF]
+    add x12, x29, #16
+    sub x10, x11, x12             // bytes of stack (a multiple of 16)
+    add x10, x10, #16             // + the length word, rounded up
+    bl scm_alloc
+    // copy only now: a GC inside scm_alloc may have updated the stack
+    adrp x11, _scm_stack_base@PAGE
+    ldr x11, [x11, _scm_stack_base@PAGEOFF]
+    add x12, x29, #16
+    sub x13, x11, x12
+    lsr x14, x13, #1              // word count as a fixnum: (bytes / 8) << 2
+    str x14, [x0]
+    add x15, x0, #8
+Lcallcc_copy:
+    cmp x12, x11
+    b.hs Lcallcc_copied
+    ldr x14, [x12], #8
+    str x14, [x15], #8
+    b Lcallcc_copy
+Lcallcc_copied:
+    add x0, x0, #5                // VECTOR_TAG
+    str x0, [sp, #8]
+    mov x10, #48
+    bl scm_alloc
+    adr x1, scm_cont_entry
+    mov x2, #4
+    stp x1, x2, [x0]
+    ldr x1, [sp, #8]
+    add x2, x29, #16              // caller sp
+    stp x1, x2, [x0, #16]
+    ldp x1, x2, [x29]             // caller x29, return address
+    stp x1, x2, [x0, #32]
+    add x0, x0, #2                // CLOSURE_TAG: the continuation is f's argument
+    ldr x8, [sp]
+    and x10, x8, #7
+    cmp x10, #2
+    b.ne Lcallcc_notproc
+    ldur x10, [x8, #-2]
+    mov x9, #1
+    mov sp, x29
+    ldp x29, x30, [sp], #16
+    br x10
+
+// Invoking a continuation: x8 = the continuation, x0 = the value. Put the
+// saved stack back (using no stack ourselves: it may be the part being
+// overwritten) and return to the saved return address.
+    .p2align 2
+scm_cont_entry:
+    cmp x9, #1
+    b.eq Lcont_go
+    cbnz x9, Lcont_arity
+    mov x0, #0x4F                 // (k) with no value passes void
+Lcont_go:
+    sub x8, x8, #2
+    ldp x1, x2, [x8, #16]         // stack copy, saved sp
+    ldp x3, x4, [x8, #32]         // saved x29, return address
+    mov sp, x2
+    ldur x5, [x1, #-5]            // word count (fixnum)
+    add x1, x1, #3                // first word: vector - tag + 8
+    add x5, x2, x5, lsl #1        // end address: sp + count * 8
+Lcont_copy:
+    cmp x2, x5
+    b.hs Lcont_copied
+    ldr x6, [x1], #8
+    str x6, [x2], #8
+    b Lcont_copy
+Lcont_copied:
+    mov x29, x3
+    br x4
+
+Lcallcc_arity:
+    lsl x1, x9, #2
+    adrp x0, Lcallcc_arity_msg@PAGE
+    add x0, x0, Lcallcc_arity_msg@PAGEOFF
+    bl _scheme_error
+Lcallcc_notproc:
+    mov x1, x8
+    adrp x0, Lcallcc_notproc_msg@PAGE
+    add x0, x0, Lcallcc_notproc_msg@PAGEOFF
+    bl _scheme_error
+Lcont_arity:
+    lsl x1, x9, #2
+    adrp x0, Lcont_arity_msg@PAGE
+    add x0, x0, Lcont_arity_msg@PAGEOFF
+    bl _scheme_error
+
+    .section __TEXT,__cstring
+Lcallcc_arity_msg:
+    .asciz "call/cc: expected 1 argument(s), got"
+Lcallcc_notproc_msg:
+    .asciz "call/cc: expected a procedure, got"
+Lcont_arity_msg:
+    .asciz "continuation: expected 0 or 1 argument(s), got"
+    .text
 "#;

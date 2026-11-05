@@ -1,0 +1,17 @@
+[package]
+name = "quill-playground"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Built for wasm32-unknown-unknown; see playground/build.sh.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+quill = { path = ".." }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
